@@ -1,0 +1,597 @@
+<!doctype html>
+<!--
+  FIXTURE post-dialog.html: a Facebook group post opened as a modal [role=dialog] over the group
+  feed, reproducing the DOM facts of SPEC §1 (English UI). Self-contained (inline CSS/JS, data: URIs).
+
+  Served at https://www.facebook.com/groups/<slug>/posts/<postId>/ (or loaded with setContent).
+    postId : from location.pathname /posts/<id>/, fallback 1001.  slug: fallback "testgroup".
+    ids    : for post 1001 comment ids are exactly the numbers below; for any other post P they are
+             prefixed with "<digits of P>0" (post 1002: 2001 -> 100202001) so ids stay unique.
+    ?variant=minus1 : top-level comment C5 (2005, "Zaw Min Oo") is omitted (tests "missing" marking).
+    Timing / behaviour variants (query params, combinable; used by tests/browser/driver.test.mjs):
+    ?loadMs=<ms>        every loader (expanders, lazy load, sort) takes <ms> instead of 300 ms
+    ?keepLabel=1        expanders keep their label while loading, with a progressbar after them
+                        (instead of being replaced by the spinner)
+    ?duds=<n>           n extra "View 1 reply" buttons (under C2, C3, C5, C6) that load nothing
+                        (Facebook counts a reply that was deleted); every other thread still expands
+    ?dialogDelay=<ms>   the dialog mounts <ms> after load; until then only the feed behind is shown
+                        (a post URL loaded directly), and its [role=main] must not be taken for the post
+    ?feedbackDelay=<ms> the post's counts row and sort control render <ms> after load
+    ?bodyLink=<id>      the post body contains a pasted link to another group post /posts/<id>/
+    The dialog's "Close" button removes the dialog and goes back to the group feed with
+    history.pushState (Facebook's SPA close).
+
+  Comments (DOM pre-order once fully expanded; replies are FLAT siblings after their parent):
+    C1  2001 Thura Min Oo      2 paragraphs, "5 reactions; see who reacted to this"
+      R1  3001 Aye Chan Moe      reply to C1, "1 reaction; see who reacted to this"
+      R2  3002 Min Thu           reply to C1, Myanmar text
+        R3  3003 Thura Min Oo  reply to R2's reply (comment_id=2001, reply_comment_id=3003)
+    C2  2002 Chai_lover🍵      emoji <img alt> in author name and body
+    S1  2011 LuckyPanda7781      only after sort "All comments"
+    C3  2003 Su Su Hlaing        truncated, "See more" expands to 2 paragraphs
+    C4  2004 Ei Mon Kyaw         200x150 image attachment
+      R4  3004 Kyaw Zin Thant    reply to C4
+      R5  3005 Chai_lover🍵    reply to C4, emoji in body
+    C5  2005 Zaw Min Oo          (absent with ?variant=minus1)
+    S2  2012 Crypto Deals Official   only after sort "All comments"
+    C6  2006 Thiri Aung          after "View more comments"
+    C7  2007 Nay Lin             after "View more comments"; l.facebook.com link (inline + preview card)
+    C8  2008 Hnin Wai            after "View more comments"
+    C9  2009 Phyo Wai            lazy-loaded when the dialog's inner scroller reaches the bottom
+    C10 2010 Khin Myat           lazy-loaded; sticker only (120x120 image, empty text)
+
+  EXPECTED TOTALS (dialog only; the feed preview comment by "Feed Preview Person" (2999) that sits
+  in [role=main] behind the dialog must never be extracted):
+    initial (sort "Most relevant") : 5 comment articles (C1..C5)          minus1: 4
+    + sort "All comments"          : +2 top-level (S1, S2)                 -> 7   (minus1: 6)
+    + "View more comments"         : +3 top-level (C6..C8)
+    + lazy load on scroll          : +2 top-level (C9, C10)
+    + "View 2 replies" under C1    : +2 replies (R1, R2) and a nested "View 1 reply" after R2
+    + "View 1 reply"               : +1 reply-to-reply (R3)
+    + "View 2 replies" under C4    : +2 replies (R4, R5) and a "Hide replies" button (never click)
+    FULLY EXPANDED : 17 = 12 top-level + 4 replies (depth 1) + 1 reply-to-reply (depth 2)
+                     minus1: 16 = 11 top-level + 5 replies
+    "Leave a comment" count button: "12".  Initial expanders: 3.  Initial "See more": 2 (post + C3).
+    Indentation (margin-left): depth 0 = 16px, depth 1 = 77px, depth 2 = 119px inside the scroller.
+    All loaders resolve after 300 ms (?loadMs) and show a [role=progressbar] while loading.
+-->
+<html lang="en" dir="ltr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Test Group | Facebook</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    font: 15px/1.34 system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans Myanmar", "Myanmar Text", Padauk, sans-serif;
+    color: #050505; background: #f0f2f5;
+  }
+  body.modal-open { overflow: hidden; }
+  a { color: inherit; text-decoration: none; }
+  .banner { position: sticky; top: 0; height: 56px; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.2);
+    display: flex; align-items: center; padding: 0 16px; font-weight: 700; font-size: 24px; color: #0866ff; z-index: 2; }
+  .main { width: 680px; max-width: calc(100vw - 32px); margin: 16px auto; }
+  .card { background: #fff; border-radius: 8px; box-shadow: 0 1px 2px rgba(0,0,0,.2); padding: 12px 0; margin-bottom: 16px; }
+  .post-header { display: flex; gap: 8px; align-items: center; padding: 0 16px 8px; }
+  .post-meta { flex: 1; }
+  .post-meta h3 { margin: 0; font-size: 15px; }
+  .sub { color: #65676b; font-size: 13px; }
+  .avatar40 { width: 40px; height: 40px; flex: none; }
+  .avatar32 { width: 32px; height: 32px; flex: none; }
+  .post-menu, .close { width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center; cursor: pointer; }
+  .story { padding: 0 16px 8px; }
+  .post-photo img, .post-photo .ph { display: block; width: 100%; height: 340px; object-fit: cover; }
+  .post-counts { display: flex; justify-content: space-between; padding: 8px 16px; border-bottom: 1px solid #ced0d4; color: #65676b; }
+  .post-counts [role=button] { min-width: 40px; cursor: pointer; }
+  .sort-row { padding: 8px 16px; }
+  .sort-btn { display: inline-flex; gap: 4px; align-items: center; font-weight: 600; color: #65676b; cursor: pointer; }
+  .menu { position: fixed; z-index: 100; width: 300px; background: #fff; border-radius: 8px; padding: 8px;
+    box-shadow: 0 12px 28px rgba(0,0,0,.2), 0 2px 4px rgba(0,0,0,.1); }
+  .menuitem { padding: 8px; border-radius: 6px; cursor: pointer; }
+  .menuitem:hover { background: #f2f2f2; }
+  .mi-title { font-weight: 600; }
+  .mi-desc { font-size: 12px; color: #65676b; }
+  .cmt { display: flex; gap: 6px; margin: 8px 16px 0 16px; }
+  .cmt.depth1 { margin-left: 77px; }
+  .cmt.depth2 { margin-left: 119px; }
+  .cmt-main { flex: 1; min-width: 0; }
+  .bubble { display: inline-block; background: #f0f2f5; border-radius: 18px; padding: 8px 12px; max-width: 100%; }
+  .bubble .author { font-weight: 600; font-size: 13px; }
+  .bubble .time { font-size: 12px; color: #65676b; }
+  .bubble .text { display: block; }
+  .emoji { width: 16px; height: 16px; vertical-align: -3px; }
+  .see-more { display: inline; font-weight: 600; cursor: pointer; }
+  .cmt-actions { display: flex; gap: 12px; align-items: center; padding: 2px 12px; font-size: 12px; font-weight: 700; color: #65676b; }
+  .cmt-actions [role=button] { cursor: pointer; }
+  .reactions { display: inline-flex; align-items: center; gap: 2px; margin-left: auto; font-weight: 400; }
+  .attachment img, .sticker img { display: block; margin-top: 4px; border-radius: 8px; }
+  .link-card { display: block; margin-top: 4px; max-width: 320px; border: 1px solid #ced0d4; border-radius: 8px; overflow: hidden; }
+  .link-card .lc-img { height: 80px; background: #dfe3ee; }
+  .link-card .lc-text { display: flex; flex-direction: column; padding: 6px 10px; font-size: 13px; }
+  .expander { display: inline-block; margin: 6px 16px 0 58px; font-weight: 600; font-size: 14px; color: #65676b; cursor: pointer; }
+  .expander.depth1 { margin-left: 119px; }
+  .expander.depth2 { margin-left: 161px; }
+  .expander.top { margin-left: 16px; }
+  .spinner { width: 20px; height: 20px; margin: 8px 16px 0 58px; border-radius: 50%; border: 3px solid #ced0d4; border-top-color: #0866ff; }
+  .empty-state { padding: 24px 16px; text-align: center; color: #65676b; }
+  .sentinel { height: 1px; }
+  /* Modal layer */
+  .overlay { position: fixed; inset: 0; z-index: 10; background: rgba(244,244,244,.85);
+    display: flex; align-items: center; justify-content: center; }
+  .post-dialog { width: min(700px, calc(100vw - 32px)); height: min(680px, calc(100vh - 40px)); background: #fff;
+    border-radius: 8px; box-shadow: 0 12px 28px rgba(0,0,0,.2); display: flex; flex-direction: column; overflow: hidden; }
+  .dlg-header { flex: none; height: 60px; display: flex; align-items: center; justify-content: center; position: relative;
+    border-bottom: 1px solid #ced0d4; }
+  .dlg-header h2 { margin: 0; font-size: 20px; }
+  .dlg-header .close { position: absolute; right: 16px; top: 12px; background: #e4e6eb; }
+  .scroller { flex: 1 1 auto; overflow-y: auto; overscroll-behavior: contain; }
+  .dialog-post { padding: 12px 0 16px; }
+  .composer { flex: none; height: 60px; display: flex; gap: 8px; align-items: center; padding: 0 16px; border-top: 1px solid #ced0d4; }
+  .composer-box { flex: 1; background: #f0f2f5; border-radius: 18px; padding: 8px 12px; color: #65676b; }
+  .chat-head { position: fixed; left: 8px; bottom: 8px; z-index: 20; width: 48px; height: 48px; border-radius: 50%;
+    background: #0866ff; }
+</style>
+</head>
+<body class="modal-open">
+<div role="banner" class="banner">facebook</div>
+
+<!-- The group feed behind the modal (still in the DOM; must be ignored by extraction). -->
+<div role="main" class="main">
+  <div role="feed" id="behind-feed"></div>
+</div>
+
+<div class="overlay">
+  <div role="dialog" aria-labelledby="dlg-title" class="post-dialog">
+    <div class="dlg-header">
+      <h2 id="dlg-title" dir="auto"><span>Kyaw Zin Thant's post</span></h2>
+      <div role="button" tabindex="0" aria-label="Close" class="close"><svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><path d="M4 4l12 12M16 4L4 16" stroke="#606770" stroke-width="2"/></svg></div>
+    </div>
+    <div class="scroller" id="scroller">
+      <div role="article" aria-labelledby="_r_3h_ _r_3i_" class="dialog-post" id="post">
+        <div class="post-header">
+          <a role="link" tabindex="-1" aria-label="Kyaw Zin Thant" class="avatar40 js-author-link"><svg width="40" height="40" aria-hidden="true"><circle cx="20" cy="20" r="20" fill="#8a8d91"/></svg></a>
+          <div class="post-meta">
+            <div data-ad-rendering-role="profile_name"><h3 id="_r_3h_" dir="auto"><span><a role="link" tabindex="0" class="js-group-link"><span>Test Group</span></a></span></h3></div>
+            <div class="sub"><span><a role="link" tabindex="0" class="js-author-link"><span>Kyaw Zin Thant</span></a></span><span aria-hidden="true"> · </span><span id="_r_3i_"><a role="link" tabindex="0"><span>4 October at 18:19</span></a></span><span aria-hidden="true"> · </span><svg width="12" height="12" role="img" aria-label="Shared with Members of Test Group"><circle cx="6" cy="6" r="6" fill="#65676b"/></svg></div>
+          </div>
+          <div role="button" tabindex="0" aria-haspopup="menu" aria-expanded="false" aria-label="Actions for this post" class="post-menu"><svg width="20" height="20" aria-hidden="true"><circle cx="4" cy="10" r="2"/><circle cx="10" cy="10" r="2"/><circle cx="16" cy="10" r="2"/></svg></div>
+        </div>
+        <div data-ad-rendering-role="story_message" class="story"><div data-ad-preview="message" data-ad-comet-preview="message" id="story"></div></div>
+        <div class="post-photo"><a role="link" tabindex="0" class="js-photo-link"><img id="post-photo" width="600" height="340" alt="May be an image of text that says 'CS DEGREE?'"></a></div>
+        <div class="post-counts">
+          <div data-ad-rendering-role="like_button"><div role="button" tabindex="0" aria-label="Like"><span>7</span></div></div>
+          <div data-ad-rendering-role="comment_button"><div role="button" tabindex="0" aria-label="Leave a comment"><span>12</span></div></div>
+          <div data-ad-rendering-role="share_button"><div role="button" tabindex="0" aria-label="Share"><span>3</span></div></div>
+        </div>
+        <div class="sort-row"><div role="button" tabindex="0" aria-haspopup="menu" aria-expanded="false" class="sort-btn" id="sort-btn"><span id="sort-label">Most relevant</span><svg width="12" height="12" aria-hidden="true"><path d="M2 4l4 4 4-4" stroke="#65676b" fill="none" stroke-width="2"/></svg></div></div>
+        <div id="comments"></div>
+        <div id="more-slot"></div>
+        <div class="sentinel" id="sentinel"></div>
+      </div>
+    </div>
+    <div class="composer"><div class="avatar32"><svg width="32" height="32" aria-hidden="true"><circle cx="16" cy="16" r="16" fill="#bcc0c4"/></svg></div><div role="textbox" contenteditable="false" aria-label="Write a public comment…" class="composer-box">Write a public comment…</div></div>
+  </div>
+</div>
+
+<!-- Decoy dialog after the post dialog: "last dialog" must mean the last one holding a post article. -->
+<div role="dialog" aria-label="Chats" class="chat-head"></div>
+
+<script>
+(function () {
+  'use strict';
+
+  // ---- URL-derived identity -----------------------------------------------------------------
+  var pathMatch = location.pathname.match(/\/groups\/([^/]+)\/(?:posts|permalink)\/([\w.-]+)/);
+  var SLUG = pathMatch ? pathMatch[1] : 'testgroup';
+  var POST_ID = pathMatch ? pathMatch[2] : '1001';
+  var ORIGIN = /(^|\.)facebook\.com$/.test(location.hostname) ? location.origin : 'https://www.facebook.com';
+  var PARAMS = new URLSearchParams(location.search);
+  var VARIANT = PARAMS.get('variant') || '';
+  var LOAD_MS = Number(PARAMS.get('loadMs')) || 300;
+  var KEEP_LABEL = PARAMS.get('keepLabel') === '1';
+  var DUD_KEYS = ['C2', 'C3', 'C5', 'C6'].slice(0, Number(PARAMS.get('duds')) || 0);
+  var DIALOG_DELAY = Number(PARAMS.get('dialogDelay')) || 0;
+  var FEEDBACK_DELAY = Number(PARAMS.get('feedbackDelay')) || 0;
+  var BODY_LINK = (PARAMS.get('bodyLink') || '').replace(/[^\w.-]/g, '');
+  var ID_PREFIX = POST_ID === '1001' ? '' : POST_ID.replace(/\D/g, '') + '0';
+  var TRACK = '__cft__[0]=AZX&__tn__=R]-R';
+  var POST_URL = ORIGIN + '/groups/' + SLUG + '/posts/' + POST_ID + '/';
+
+  function cid(n) { return ID_PREFIX + n; }
+  function userUrl(uid) { return ORIGIN + '/groups/' + SLUG + '/user/' + uid + '/?' + TRACK; }
+  function esc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+  function svgData(w, h, fill) {
+    return 'data:image/svg+xml,' + encodeURIComponent(
+      '<svg xmlns="http://www.w3.org/2000/svg" width="' + w + '" height="' + h + '"><rect width="100%" height="100%" fill="' + fill + '"/></svg>');
+  }
+  var EMOJI_SRC = svgData(16, 16, '#f7b928');
+  var LIKE_SRC = svgData(16, 16, '#0866ff');
+  var LOVE_SRC = svgData(16, 16, '#f33e58');
+
+  function E(alt) { return '<img alt="' + alt + '" width="16" height="16" class="emoji" src="' + EMOJI_SRC + '">'; }
+  function P(html) { return '<div dir="auto">' + html + '</div>'; }
+  var SEE_MORE = '<div role="button" tabindex="0" class="see-more">See more</div>';
+
+  var ROADMAP_INLINE = 'https://l.facebook.com/l.php?u=' + encodeURIComponent('https://roadmap.sh/') + '&h=AT0inlineXYZ';
+  var ROADMAP_CARD = 'https://l.facebook.com/l.php?u=' + encodeURIComponent('https://roadmap.sh/') + '&h=AT1cardXYZ';
+
+  // ---- Comment data ---------------------------------------------------------------------------
+  // rank = position among top-level comments (keeps DOM order deterministic whatever the click order).
+  var DATA = {
+    C1: { n: 2001, rank: 10, name: 'Thura Min Oo', uid: 100101, ago: '2 days ago', aria: 'Monday 12 October 2026 at 08:54', t: '2d',
+          body: P('Hardly any degree exists that teaches you everything you need on the job.') +
+                P('Is there truly a degree that covers Kubernetes, React and SQL at the same time?'),
+          reactions: 5 },
+    R1: { n: 3001, parent: 'C1', name: 'Aye Chan Moe', uid: 100102, ago: '1 day ago', aria: 'Tuesday 13 October 2026 at 10:02', t: '1d',
+          body: P('Agreed. Self-study fills most of the gap.'), reactions: 1 },
+    R2: { n: 3002, parent: 'C1', name: 'Min Thu', uid: 100103, ago: '20 hours ago', aria: 'Tuesday 13 October 2026 at 05:12', t: '20h',
+          body: P('ကျွန်တော်လည်း သဘောတူပါတယ်။') },
+    R3: { n: 3003, parent: 'R2', name: 'Thura Min Oo', uid: 100101, ago: '18 hours ago', aria: 'Tuesday 13 October 2026 at 07:30', t: '18h',
+          body: P('Thanks Min Thu!') },
+    C2: { n: 2002, rank: 20, name: 'Chai_lover🍵', nameHtml: 'Chai_lover' + E('🍵'), uid: 100104, ago: '3 days ago',
+          aria: 'Sunday 11 October 2026 at 21:15', t: '3d',
+          body: P('Coding with tea ' + E('🍵') + ' is the best ' + E('😂')) },
+    S1: { n: 2011, rank: 25, name: 'LuckyPanda7781', uid: 100113, ago: '4 days ago', aria: 'Saturday 10 October 2026 at 03:03', t: '4d',
+          body: P('Earn $500 a day from home, DM me now!!!') },
+    C3: { n: 2003, rank: 30, name: 'Su Su Hlaing', uid: 100105, ago: '3 days ago', aria: 'Sunday 11 October 2026 at 19:40', t: '3d',
+          body: P('When I started my career I thought a CS degree was required for every job, but after working at three companies I learned that… ' + SEE_MORE),
+          full: P('When I started my career I thought a CS degree was required for every job, but after working at three companies I learned that what matters most is how fast you can learn.') +
+                P('Build projects, read the docs, and ask questions in this group!') },
+    C4: { n: 2004, rank: 40, name: 'Ei Mon Kyaw', uid: 100106, ago: '4 days ago', aria: 'Saturday 10 October 2026 at 12:05', t: '4d',
+          body: P('Here is my study setup:'),
+          extra: '<div class="attachment"><a role="link" tabindex="0" href="' + esc(ORIGIN + '/photo/?fbid=5001&set=p.5001&' + TRACK) + '">' +
+                 '<img width="200" height="150" alt="May be an image of laptop, desk and coffee cup" src="' + svgData(200, 150, '#90a4ae') + '"></a></div>',
+          hideReplies: true },
+    R4: { n: 3004, parent: 'C4', name: 'Kyaw Zin Thant', uid: 100001, ago: '3 days ago', aria: 'Sunday 11 October 2026 at 09:00', t: '3d',
+          body: P('Nice setup!') },
+    R5: { n: 3005, parent: 'C4', name: 'Chai_lover🍵', nameHtml: 'Chai_lover' + E('🍵'), uid: 100104, ago: '2 days ago',
+          aria: 'Monday 12 October 2026 at 14:22', t: '2d',
+          body: P('Is that a matcha ' + E('🍵') + ' on the desk?') },
+    C5: { n: 2005, rank: 50, name: 'Zaw Min Oo', uid: 100107, ago: '5 days ago', aria: 'Friday 9 October 2026 at 16:45', t: '5d',
+          body: P('Bootcamps worked for me.') },
+    S2: { n: 2012, rank: 55, name: 'Crypto Deals Official', uid: 100114, ago: '5 days ago', aria: 'Friday 9 October 2026 at 02:02', t: '5d',
+          body: P('Best signals group, join now') },
+    C6: { n: 2006, rank: 60, name: 'Thiri Aung', uid: 100108, ago: '6 days ago', aria: 'Thursday 8 October 2026 at 11:11', t: '6d',
+          body: P('A degree still helps with visas and some government jobs.') },
+    C7: { n: 2007, rank: 70, name: 'Nay Lin', uid: 100109, ago: '1 week ago', aria: 'Wednesday 7 October 2026 at 08:00', t: '1w',
+          body: P('Roadmap here: <a role="link" tabindex="0" target="_blank" rel="nofollow noreferrer" href="' + esc(ROADMAP_INLINE) + '">https://roadmap.sh/</a>'),
+          extra: '<a role="link" tabindex="0" target="_blank" rel="nofollow noreferrer" class="link-card" href="' + esc(ROADMAP_CARD) + '">' +
+                 '<div class="lc-img"></div><div class="lc-text"><span>ROADMAP.SH</span><span>Developer Roadmaps</span></div></a>' },
+    C8: { n: 2008, rank: 80, name: 'Hnin Wai', uid: 100110, ago: '1 week ago', aria: 'Tuesday 6 October 2026 at 22:30', t: '1w',
+          body: P('Portfolio &gt; degree.') },
+    C9: { n: 2009, rank: 90, name: 'Phyo Wai', uid: 100111, ago: '1 week ago', aria: 'Monday 5 October 2026 at 13:45', t: '1w',
+          body: P('Both matter, honestly.') },
+    C10: { n: 2010, rank: 100, name: 'Khin Myat', uid: 100112, ago: '1 week ago', aria: 'Monday 5 October 2026 at 09:15', t: '1w',
+          body: '',
+          extra: '<div class="sticker"><img width="120" height="120" alt="Thumbs up sticker" src="' + svgData(120, 120, '#ffd54f') + '"></div>' },
+    // Lives in the feed preview BEHIND the dialog.
+    F1: { n: 2999, name: 'Feed Preview Person', uid: 100199, ago: '1 hour ago', aria: 'Wednesday 14 October 2026 at 00:10', t: '1h',
+          body: P('This preview comment belongs to the feed behind the dialog.') }
+  };
+
+  function depthOf(key) { var c = DATA[key]; return c.parent ? depthOf(c.parent) + 1 : 0; }
+  function threadRoot(key) { var c = DATA[key]; return c.parent ? threadRoot(c.parent) : key; }
+  function childrenOf(key) { return Object.keys(DATA).filter(function (k) { return DATA[k].parent === key; }); }
+
+  function ariaLabelOf(key) {
+    var c = DATA[key];
+    if (!c.parent) return 'Comment by ' + c.name + ' ' + c.ago;
+    var p = DATA[c.parent];
+    return 'Reply by ' + c.name + ' to ' + p.name + "'s " + (p.parent ? 'reply' : 'comment') + ' ' + c.ago;
+  }
+
+  function commentHref(key) {
+    var c = DATA[key];
+    var href = POST_URL + '?comment_id=' + cid(DATA[threadRoot(key)].n);
+    if (c.parent) href += '&reply_comment_id=' + cid(c.n);
+    return href + '&' + TRACK;
+  }
+
+  function reactionsHtml(count) {
+    var label = count === 1 ? '1 reaction; see who reacted to this' : count + ' reactions; see who reacted to this';
+    return '<div role="button" tabindex="0" aria-label="' + label + '" class="reactions">' +
+      '<img alt="" width="16" height="16" src="' + LIKE_SRC + '"><img alt="" width="16" height="16" src="' + LOVE_SRC + '">' +
+      '<span>' + count + '</span></div>';
+  }
+
+  /** One flat comment/reply article, mirroring the observed structure (SPEC §1). */
+  function commentEl(key) {
+    var c = DATA[key];
+    var art = document.createElement('div');
+    art.setAttribute('role', 'article');
+    art.setAttribute('aria-label', ariaLabelOf(key));
+    art.setAttribute('tabindex', '-1');
+    art.className = 'cmt depth' + depthOf(key);
+    var user = esc(userUrl(c.uid));
+    art.innerHTML =
+      '<a role="link" tabindex="-1" class="avatar32" href="' + user + '"><svg width="32" height="32" aria-hidden="true"><circle cx="16" cy="16" r="16" fill="#bcc0c4"/></svg></a>' +
+      '<div class="cmt-main">' +
+        '<div class="bubble">' +
+          '<a role="link" tabindex="0" class="author" href="' + user + '"><span dir="auto">' + (c.nameHtml || c.name) + '</span></a>' +
+          '<span aria-hidden="true"> · </span>' +
+          '<a role="link" tabindex="0" class="time" aria-label="' + esc(c.aria) + '" href="' + esc(commentHref(key)) + '"><span dir="auto">' + c.t + '</span></a>' +
+          (c.body ? '<span dir="auto" class="text">' + c.body + '</span>' : '') +
+        '</div>' +
+        (c.extra || '') +
+        '<div class="cmt-actions">' +
+          '<div role="button" tabindex="0" aria-label="Hide or report this"><svg width="12" height="12" aria-hidden="true"><circle cx="6" cy="6" r="2"/></svg></div>' +
+          '<div role="button" tabindex="0" aria-label="Like">Like</div>' +
+          '<div role="button" tabindex="0" aria-label="React"><svg width="12" height="12" aria-hidden="true"><circle cx="6" cy="6" r="5"/></svg></div>' +
+          '<div role="button" tabindex="0">Reply</div>' +
+          '<div role="button" tabindex="0">Share</div>' +
+          (c.reactions ? reactionsHtml(c.reactions) : '') +
+        '</div>' +
+      '</div>';
+    var seeMore = art.querySelector('.see-more');
+    if (seeMore && c.full) {
+      var body = art.querySelector('.text');
+      seeMore.addEventListener('click', function () { body.innerHTML = c.full; });
+    }
+    return art;
+  }
+
+  function spinner() {
+    var s = document.createElement('div');
+    s.setAttribute('role', 'progressbar');
+    s.setAttribute('aria-label', 'Loading...');
+    s.className = 'spinner';
+    return s;
+  }
+
+  /**
+   * A "View …" button: replaced by a spinner on click, then (LOAD_MS later) by load()'s nodes.
+   * With ?keepLabel=1 the button keeps its label while a spinner shows after it.
+   */
+  function expander(label, className, load) {
+    var b = document.createElement('div');
+    b.setAttribute('role', 'button');
+    b.setAttribute('tabindex', '0');
+    b.className = 'expander ' + className;
+    var span = document.createElement('span');
+    span.textContent = label;
+    b.appendChild(span);
+    var busy = false;
+    b.addEventListener('click', function () {
+      if (busy) return;
+      busy = true;
+      var spin = spinner();
+      if (KEEP_LABEL) b.after(spin);
+      else b.replaceWith(spin);
+      setTimeout(function () {
+        var nodes = load();
+        if (KEEP_LABEL) {
+          spin.remove();
+          b.replaceWith.apply(b, nodes);
+        } else {
+          spin.replaceWith.apply(spin, nodes);
+        }
+      }, LOAD_MS);
+    });
+    return b;
+  }
+
+  /** "View 1 reply" for a reply that no longer exists: clicking it loads nothing. */
+  function dudButton(key) {
+    var b = document.createElement('div');
+    b.setAttribute('role', 'button');
+    b.setAttribute('tabindex', '0');
+    b.className = 'expander depth' + depthOf(key);
+    b.innerHTML = '<span>View 1 reply</span>';
+    return b;
+  }
+
+  function repliesButton(key) {
+    var kids = childrenOf(key);
+    if (!kids.length) return null;
+    var label = kids.length === 1 ? 'View 1 reply' : 'View ' + kids.length + ' replies';
+    return expander(label, 'depth' + depthOf(key), function () {
+      var nodes = [];
+      kids.forEach(function (k) {
+        nodes.push(commentEl(k));
+        var nested = repliesButton(k);
+        if (nested) nodes.push(nested);
+      });
+      if (DATA[key].hideReplies) nodes.push(hideRepliesButton(key, nodes.slice()));
+      return nodes;
+    });
+  }
+
+  /** "Hide replies" collapses the thread again. Patterns must never match/click it. */
+  function hideRepliesButton(key, nodes) {
+    var b = document.createElement('div');
+    b.setAttribute('role', 'button');
+    b.setAttribute('tabindex', '0');
+    b.className = 'expander depth' + depthOf(key);
+    b.innerHTML = '<span>Hide replies</span>';
+    b.addEventListener('click', function () {
+      nodes[0].before(repliesButton(key));
+      nodes.forEach(function (n) { n.remove(); });
+      b.remove();
+    });
+    return b;
+  }
+
+  // ---- Dialog post ----------------------------------------------------------------------------
+  var list = document.getElementById('comments');
+  var rankOf = new WeakMap();
+
+  /** Insert a top-level comment (and its "View N replies" button) at its rank position. */
+  function insertTop(key) {
+    var c = DATA[key];
+    var el = commentEl(key);
+    rankOf.set(el, c.rank);
+    var next = Array.prototype.find.call(list.children, function (x) { return rankOf.has(x) && rankOf.get(x) > c.rank; }) || null;
+    list.insertBefore(el, next);
+    var rb = repliesButton(key);
+    if (rb) el.after(rb);
+    if (DUD_KEYS.indexOf(key) !== -1) el.after(dudButton(key));
+  }
+
+  document.querySelectorAll('.js-author-link').forEach(function (a) { a.setAttribute('href', ORIGIN + '/groups/' + SLUG + '/user/100001/?__cft__[0]=AZX&__tn__=-]C%2CP-R'); });
+  document.querySelector('.js-group-link').setAttribute('href', ORIGIN + '/groups/' + SLUG + '/?__cft__[0]=AZX&__tn__=-UC%2CP-R');
+  document.querySelector('.js-photo-link').setAttribute('href', ORIGIN + '/photo/?fbid=4001&set=gm.' + POST_ID + '&__cft__[0]=AZX&__tn__=EH-R');
+  document.getElementById('post-photo').src = svgData(600, 340, '#b0bec5');
+
+  var STORY_FIRST = P('Do you need a CS degree to become a software engineer in Myanmar? ' + E('🤔')) +
+    (BODY_LINK ? P('Related: <a role="link" tabindex="0" href="' + esc(ORIGIN + '/groups/' + SLUG + '/posts/' + BODY_LINK + '/?__cft__[0]=AZX&__tn__=R]-R') + '">' +
+      esc(ORIGIN + '/groups/' + SLUG + '/posts/' + BODY_LINK + '/') + '</a>') : '');
+  var story = document.getElementById('story');
+  story.innerHTML = STORY_FIRST +
+    P('I have been working as a developer for five years and I keep hearing different opinions… ' + SEE_MORE);
+  story.querySelector('.see-more').addEventListener('click', function () {
+    story.innerHTML = STORY_FIRST +
+      P('I have been working as a developer for five years and I keep hearing different opinions about this. Some companies here only hire graduates, others only care about your GitHub.') +
+      P('What do you all think? ဘယ်လိုထင်ကြလဲ');
+  });
+
+  ['C1', 'C2', 'C3', 'C4', 'C5'].forEach(function (key) {
+    if (key === 'C5' && VARIANT === 'minus1') return;
+    insertTop(key);
+  });
+
+  document.getElementById('more-slot').appendChild(expander('View more comments', 'top', function () {
+    ['C6', 'C7', 'C8'].forEach(insertTop);
+    return [];
+  }));
+
+  // Lazy load when the inner scroller reaches the bottom (like Facebook's infinite comments).
+  var scroller = document.getElementById('scroller');
+  var sentinel = document.getElementById('sentinel');
+  var lazyDone = false;
+  var io = new IntersectionObserver(function (entries) {
+    if (lazyDone || !entries.some(function (e) { return e.isIntersecting; })) return;
+    lazyDone = true;
+    io.disconnect();
+    var spin = spinner();
+    sentinel.before(spin);
+    setTimeout(function () {
+      spin.remove();
+      ['C9', 'C10'].forEach(insertTop);
+    }, LOAD_MS);
+  }, { root: scroller, threshold: 0 });
+  io.observe(sentinel);
+
+  // ---- Sort menu ------------------------------------------------------------------------------
+  var SORT_ITEMS = [
+    ['Most relevant', "Show friends' comments and the most engaging comments first."],
+    ['Newest', 'Show all comments with the newest comments first.'],
+    ['All comments', 'Show all comments, including potential spam.']
+  ];
+  var sortBtn = document.getElementById('sort-btn');
+  var sortLabel = document.getElementById('sort-label');
+  var menu = null;
+  var spamShown = false;
+
+  function closeMenu() {
+    if (!menu) return;
+    menu.remove();
+    menu = null;
+    sortBtn.setAttribute('aria-expanded', 'false');
+  }
+
+  function choose(title) {
+    closeMenu();
+    sortLabel.textContent = title;
+    if (title === 'All comments' && !spamShown) {
+      spamShown = true;
+      var spin = spinner();
+      list.before(spin);
+      setTimeout(function () { spin.remove(); insertTop('S1'); insertTop('S2'); }, LOAD_MS);
+    }
+  }
+
+  function openMenu() {
+    menu = document.createElement('div');
+    menu.setAttribute('role', 'menu');
+    menu.className = 'menu';
+    SORT_ITEMS.forEach(function (item) {
+      var mi = document.createElement('div');
+      mi.setAttribute('role', 'menuitem');
+      mi.setAttribute('tabindex', '-1');
+      mi.className = 'menuitem';
+      var title = document.createElement('div');
+      title.className = 'mi-title';
+      title.textContent = item[0];
+      var desc = document.createElement('div');
+      desc.className = 'mi-desc';
+      desc.textContent = item[1];
+      mi.append(title, desc);
+      mi.addEventListener('click', function () { choose(item[0]); });
+      menu.appendChild(mi);
+    });
+    document.body.appendChild(menu);
+    // Keep the whole menu inside the viewport (below the button if it fits, else above).
+    var r = sortBtn.getBoundingClientRect();
+    var h = menu.offsetHeight;
+    var top = r.bottom + 4 + h <= innerHeight - 8 ? r.bottom + 4 : Math.max(8, r.top - 4 - h);
+    menu.style.left = Math.max(8, r.left) + 'px';
+    menu.style.top = top + 'px';
+    sortBtn.setAttribute('aria-expanded', 'true');
+  }
+
+  sortBtn.addEventListener('click', function (e) {
+    e.stopPropagation();
+    if (menu) closeMenu(); else openMenu();
+  });
+  document.addEventListener('click', function (e) { if (menu && !menu.contains(e.target)) closeMenu(); });
+  document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeMenu(); });
+
+  // ---- Feed behind the dialog (same post, with one preview comment) ----------------------------
+  var behind = document.getElementById('behind-feed');
+  var unit = document.createElement('div');
+  unit.innerHTML =
+    '<div role="article" aria-labelledby="_r_b1_ _r_b2_" class="card">' +
+      '<div class="post-header">' +
+        '<a role="link" tabindex="-1" aria-label="Kyaw Zin Thant" class="avatar40" href="' + esc(userUrl(100001)) + '"><svg width="40" height="40" aria-hidden="true"><circle cx="20" cy="20" r="20" fill="#8a8d91"/></svg></a>' +
+        '<div class="post-meta">' +
+          '<div data-ad-rendering-role="profile_name"><h3 id="_r_b1_" dir="auto"><span><a role="link" tabindex="0" href="' + esc(userUrl(100001)) + '"><strong><span>Kyaw Zin Thant</span></strong></a></span></h3></div>' +
+          '<div class="sub" id="_r_b2_"><span><a role="link" tabindex="0" href="' + esc(POST_URL + '?__cft__[0]=AZX&__tn__=%2CO%2CP-R') + '"><span>1w</span></a></span></div>' +
+        '</div>' +
+      '</div>' +
+      '<div data-ad-rendering-role="story_message" class="story"><div data-ad-preview="message" data-ad-comet-preview="message">' +
+        P('Do you need a CS degree to become a software engineer in Myanmar? ' + E('🤔')) + '</div></div>' +
+      '<div class="post-counts">' +
+        '<div data-ad-rendering-role="like_button"><div role="button" tabindex="0" aria-label="Like"><span>7</span></div></div>' +
+        '<div data-ad-rendering-role="comment_button"><div role="button" tabindex="0" aria-label="Leave a comment"><span>12</span></div></div>' +
+        '<div data-ad-rendering-role="share_button"><div role="button" tabindex="0" aria-label="Share"><span>3</span></div></div>' +
+      '</div>' +
+      '<div class="preview"></div>' +
+    '</div>';
+  var preview = unit.querySelector('.preview');
+  preview.appendChild(commentEl('F1'));
+  preview.appendChild(expander('View more comments', 'top', function () { return []; }));
+  behind.appendChild(unit);
+
+  // ---- Close (SPA): the dialog goes away and the URL returns to the group feed ------------------
+  var overlay = document.querySelector('.overlay');
+  document.querySelector('[role="dialog"] [aria-label="Close"]').addEventListener('click', function () {
+    overlay.remove();
+    document.body.classList.remove('modal-open');
+    history.pushState({}, '', '/groups/' + SLUG + '/');
+  });
+
+  // ---- Timing variants ------------------------------------------------------------------------
+  if (FEEDBACK_DELAY) {
+    var counts = document.querySelector('#post .post-counts');
+    var sortRow = document.querySelector('#post .sort-row');
+    var anchor = document.getElementById('comments');
+    counts.remove();
+    sortRow.remove();
+    setTimeout(function () { anchor.before(counts, sortRow); }, FEEDBACK_DELAY);
+  }
+  if (DIALOG_DELAY) {
+    var chatHead = document.querySelector('.chat-head');
+    overlay.remove();
+    document.body.classList.remove('modal-open');
+    setTimeout(function () {
+      document.body.insertBefore(overlay, chatHead);
+      document.body.classList.add('modal-open');
+    }, DIALOG_DELAY);
+  }
+})();
+</script>
+</body>
+</html>

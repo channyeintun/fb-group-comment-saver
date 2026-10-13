@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>FB Comment Saver</title>
+    <link rel="stylesheet" href="./common.css" />
+    <link rel="stylesheet" href="./sidepanel.css" />
+    <script type="module" src="./sidepanel.js"></script>
+  </head>
+  <body>
+    <header class="sp-header">
+      <div class="brand">
+        <svg class="brand-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+          <rect width="24" height="24" rx="6" fill="currentColor" />
+          <path d="M6 7.5A1.5 1.5 0 0 1 7.5 6h9A1.5 1.5 0 0 1 18 7.5v6a1.5 1.5 0 0 1-1.5 1.5H11l-3.2 2.6a.5.5 0 0 1-.8-.4V15h0A1 1 0 0 1 6 14z" fill="#fff" />
+          <path d="M12 8.2v4.3m0 0-1.8-1.8M12 12.5l1.8-1.8" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+        <h1>FB Comment Saver</h1>
+      </div>
+      <span id="tab-chip" class="badge chip" title="Checking the active tab…">
+        <span class="dot" aria-hidden="true"></span>
+        <span id="tab-chip-label">Checking…</span>
+      </span>
+    </header>
+    <p id="tab-line" class="tab-line" hidden></p>
+
+    <main class="sp-main">
+      <!-- This post -->
+      <section class="card" aria-labelledby="post-heading">
+        <div class="card-head">
+          <h2 id="post-heading">This post</h2>
+        </div>
+        <div class="btn-row">
+          <button id="btn-save-post" class="btn btn-primary grow" type="button" disabled>
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.5v8m0 0L4.8 7.3M8 10.5l3.2-3.2M3 13.5h10" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round" /></svg>
+            Save all comments
+          </button>
+          <button id="btn-quick-save" class="btn grow" type="button" disabled>Quick save (visible only)</button>
+        </div>
+        <p id="post-reason" class="reason" hidden></p>
+        <p class="hint">
+          <strong>Save all comments</strong> switches to “All comments”, expands every reply and “See more”,
+          then saves. <strong>Quick save</strong> only stores what is already on screen.
+        </p>
+        <div id="post-saved" class="saved-line" hidden></div>
+        <p class="hint hint-debug">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.8 15 14H1z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" /><path d="M8 6.2v3.6M8 11.7v.1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" /></svg>
+          <span>
+            Chrome shows a yellow “started debugging this browser” bar while saving — that is this extension
+            clicking for you. It disappears when the job ends; pressing <em>Cancel</em> on it stops the job.
+          </span>
+        </p>
+      </section>
+
+      <!-- Group crawl -->
+      <section class="card" aria-labelledby="crawl-heading">
+        <div class="card-head">
+          <h2 id="crawl-heading">Group crawl</h2>
+        </div>
+        <div class="field">
+          <label class="label" for="groupUrl">Group URL</label>
+          <input id="groupUrl" class="input" type="url" inputmode="url" spellcheck="false" autocomplete="off" data-setting="groupUrl" data-kind="groupUrl" placeholder="https://www.facebook.com/groups/…" aria-describedby="groupUrl-error" />
+          <p id="groupUrl-error" class="field-error" hidden></p>
+        </div>
+        <div class="field-grid">
+          <div class="field">
+            <label class="label" for="feedSort">Feed order</label>
+            <select id="feedSort" class="select" data-setting="feedSort">
+              <option value="CHRONOLOGICAL">New posts</option>
+              <option value="RECENT_ACTIVITY">New activity</option>
+              <option value="TOP_POSTS">Most relevant</option>
+              <option value="DEFAULT">Facebook default</option>
+            </select>
+          </div>
+          <div class="field">
+            <label class="label" for="maxPosts">Max posts</label>
+            <input id="maxPosts" class="input" type="number" min="1" max="500" step="1" inputmode="numeric" data-setting="maxPosts" data-kind="number" />
+          </div>
+        </div>
+        <div class="field field-inline">
+          <label class="label" for="skipSavedWithinHours">Skip posts scanned within</label>
+          <span class="inline-input">
+            <input id="skipSavedWithinHours" class="input" type="number" min="0" max="8760" step="1" inputmode="numeric" data-setting="skipSavedWithinHours" data-kind="number" aria-describedby="skip-help" />
+            <span class="unit">hours</span>
+          </span>
+        </div>
+        <p id="skip-help" class="hint tight">0 = re-scan every post.</p>
+        <div class="btn-row">
+          <button id="btn-crawl" class="btn btn-primary grow" type="button" disabled>Start crawl</button>
+          <button id="btn-open-group" class="btn" type="button">
+            Open group
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M9.5 2.5h4v4M13.5 2.5 7.5 8.5M12 9.5v3a1 1 0 0 1-1 1H3.5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h3" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round" /></svg>
+          </button>
+        </div>
+        <p id="crawl-reason" class="reason" hidden></p>
+        <p class="hint">Runs in the active Facebook tab: opens the group feed, collects post links, then saves each post in turn.</p>
+      </section>
+
+      <!-- Progress (visible when a job exists) -->
+      <section id="progress-card" class="card progress-card" aria-labelledby="progress-heading" hidden>
+        <div class="card-head">
+          <h2 id="progress-heading">Progress</h2>
+          <span id="job-badge" class="badge" role="status"><span class="dot" aria-hidden="true"></span><span id="job-badge-label">Idle</span></span>
+        </div>
+        <p id="job-meta" class="small muted"></p>
+        <p id="job-phase" class="phase" aria-live="polite"></p>
+        <div id="job-bar" class="progress" role="progressbar" aria-labelledby="job-bar-label" aria-valuemin="0">
+          <div id="job-bar-fill" class="progress-fill"></div>
+        </div>
+        <p id="job-bar-label" class="small muted bar-label"></p>
+        <dl class="counters">
+          <div class="counter" title="Comments and replies found on the page(s)"><dt>Seen</dt><dd id="cnt-seen">0</dd></div>
+          <div class="counter" title="Comments saved for the first time"><dt>New</dt><dd id="cnt-new">0</dd></div>
+          <div class="counter" title="Saved comments whose text or details changed"><dt>Updated</dt><dd id="cnt-updated">0</dd></div>
+          <div class="counter" title="Previously saved comments not found in this full scan (kept, but marked)"><dt>Missing</dt><dd id="cnt-missing">0</dd></div>
+          <div class="counter" title="Posts that could not be saved (see log)"><dt>Failed posts</dt><dd id="cnt-failed">0</dd></div>
+        </dl>
+        <p id="job-current" class="current" hidden></p>
+        <p id="job-error" class="alert alert-danger" role="alert" hidden></p>
+        <div id="job-tab-warning" class="alert alert-warn tab-warning" hidden>
+          <span>The job’s tab is in the background — Facebook may stop loading comments.</span>
+          <button id="btn-show-tab" class="btn btn-sm" type="button">Show tab</button>
+        </div>
+        <div class="btn-row">
+          <button id="btn-stop" class="btn btn-danger grow" type="button" hidden>Stop</button>
+          <button id="btn-dismiss" class="btn btn-ghost btn-sm" type="button" hidden>Dismiss</button>
+        </div>
+        <p class="note">Keep this tab visible while saving — Facebook only loads comments in a visible tab.</p>
+        <div class="log-head">
+          <h3 id="log-heading">Log</h3>
+          <span id="log-count" class="small muted"></span>
+        </div>
+        <ol id="job-log" class="log" aria-labelledby="log-heading" tabindex="0"></ol>
+      </section>
+
+      <!-- Archive -->
+      <section class="card" aria-labelledby="archive-heading">
+        <div class="card-head">
+          <h2 id="archive-heading">Archive</h2>
+        </div>
+        <div class="stats" aria-live="polite">
+          <div class="stat"><span id="stat-posts" class="stat-num">—</span><span class="stat-label">posts</span></div>
+          <div class="stat"><span id="stat-comments" class="stat-num">—</span><span class="stat-label">comments</span></div>
+          <div class="stat"><span id="stat-last" class="stat-num stat-text">—</span><span class="stat-label">last saved</span></div>
+        </div>
+        <div class="btn-row">
+          <button id="btn-open-library" class="btn btn-primary grow" type="button">Open library</button>
+        </div>
+        <div class="export-row" role="group" aria-labelledby="export-label">
+          <span id="export-label" class="small muted">Export all</span>
+          <div class="btn-group">
+            <button class="btn btn-sm" type="button" data-export="json" aria-label="Export JSON">JSON</button>
+            <button class="btn btn-sm" type="button" data-export="csv" aria-label="Export CSV">CSV</button>
+            <button class="btn btn-sm" type="button" data-export="md" aria-label="Export Markdown">Markdown</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Settings -->
+      <details id="settings" class="card settings">
+        <summary>
+          <h2>Settings</h2>
+          <span id="settings-status" class="small muted settings-status" aria-live="polite"></span>
+          <svg class="chevron" viewBox="0 0 16 16" aria-hidden="true"><path d="m4 6 4 4 4-4" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round" /></svg>
+        </summary>
+
+        <fieldset class="group">
+          <legend>While saving a post</legend>
+          <label class="check">
+            <input type="checkbox" data-setting="sortAllComments" data-kind="bool" />
+            <span>Switch to “All comments”<span class="check-help">Instead of “Most relevant” — includes comments Facebook hides as potential spam.</span></span>
+          </label>
+          <label class="check">
+            <input type="checkbox" data-setting="expandReplies" data-kind="bool" />
+            <span>Expand replies<span class="check-help">Click “View N replies” until every reply is loaded.</span></span>
+          </label>
+          <label class="check">
+            <input type="checkbox" data-setting="expandSeeMore" data-kind="bool" />
+            <span>Expand “See more”<span class="check-help">Load the full text of long posts and comments.</span></span>
+          </label>
+          <label class="check">
+            <input type="checkbox" data-setting="returnToGroupAfterCrawl" data-kind="bool" />
+            <span>Return to the group after a crawl</span>
+          </label>
+        </fieldset>
+
+        <fieldset class="group">
+          <legend>Pacing &amp; limits</legend>
+          <div class="field field-inline">
+            <label class="label" for="actionDelayMs">Delay between clicks</label>
+            <span class="inline-input">
+              <input id="actionDelayMs" class="input" type="number" min="100" max="10000" step="50" inputmode="numeric" data-setting="actionDelayMs" data-kind="number" />
+              <span class="unit">ms</span>
+            </span>
+          </div>
+          <div class="field field-inline">
+            <label class="label" for="maxExpandRounds">Max expand rounds per post</label>
+            <span class="inline-input">
+              <input id="maxExpandRounds" class="input" type="number" min="1" max="200" step="1" inputmode="numeric" data-setting="maxExpandRounds" data-kind="number" />
+            </span>
+          </div>
+          <div class="field field-inline">
+            <label class="label" for="postTimeoutSec">Time limit per post</label>
+            <span class="inline-input">
+              <input id="postTimeoutSec" class="input" type="number" min="30" max="1800" step="10" inputmode="numeric" data-setting="postTimeoutSec" data-kind="number" />
+              <span class="unit">sec</span>
+            </span>
+          </div>
+          <p class="hint tight">A random 0–50% is added to the delay so clicks look human.</p>
+        </fieldset>
+
+        <details class="advanced">
+          <summary>Advanced: button text patterns</summary>
+          <p class="hint tight">
+            Case-insensitive regular expressions matched against button text (English UI). Change them if your
+            Facebook language differs. They must never match “Like”, “Reply”, “Share” or “Hide replies”.
+          </p>
+          <div class="field">
+            <label class="label" for="expanderPattern">“View more / View replies” buttons</label>
+            <input id="expanderPattern" class="input mono" type="text" spellcheck="false" autocomplete="off" data-setting="expanderPattern" data-kind="pattern" aria-describedby="expanderPattern-error" />
+            <p id="expanderPattern-error" class="field-error" hidden></p>
+          </div>
+          <div class="field">
+            <label class="label" for="seeMorePattern">“See more” buttons</label>
+            <input id="seeMorePattern" class="input mono" type="text" spellcheck="false" autocomplete="off" data-setting="seeMorePattern" data-kind="pattern" aria-describedby="seeMorePattern-error" />
+            <p id="seeMorePattern-error" class="field-error" hidden></p>
+          </div>
+          <div class="field">
+            <label class="label" for="sortButtonPattern">Comment sort button</label>
+            <input id="sortButtonPattern" class="input mono" type="text" spellcheck="false" autocomplete="off" data-setting="sortButtonPattern" data-kind="pattern" aria-describedby="sortButtonPattern-error" />
+            <p id="sortButtonPattern-error" class="field-error" hidden></p>
+          </div>
+          <div class="field">
+            <label class="label" for="sortAllItemPattern">“All comments” menu item</label>
+            <input id="sortAllItemPattern" class="input mono" type="text" spellcheck="false" autocomplete="off" data-setting="sortAllItemPattern" data-kind="pattern" aria-describedby="sortAllItemPattern-error" />
+            <p id="sortAllItemPattern-error" class="field-error" hidden></p>
+          </div>
+        </details>
+
+        <div class="settings-foot">
+          <button id="btn-reset" class="btn btn-sm" type="button" title="Restore the defaults for the options in this section (group crawl fields are kept)">Reset to defaults</button>
+        </div>
+      </details>
+    </main>
+
+    <div id="toast-region" class="toast-region" role="status" aria-live="polite"></div>
+  </body>
+</html>

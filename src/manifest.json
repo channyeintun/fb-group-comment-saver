@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "FB Group Comment Saver",
+  "version": "0.0.0",
+  "description": "Save comments and replies from Facebook group posts to a local archive. Uses Playwright (playwright-crx) to expand every comment.",
+  "minimum_chrome_version": "118",
+  "permissions": ["debugger", "sidePanel", "storage", "unlimitedStorage", "scripting", "tabs"],
+  "host_permissions": ["https://www.facebook.com/*", "https://web.facebook.com/*", "https://facebook.com/*"],
+  "background": { "service_worker": "background.js", "type": "module" },
+  "side_panel": { "default_path": "sidepanel.html" },
+  "action": { "default_title": "FB Comment Saver", "default_icon": { "16": "icons/icon16.png", "32": "icons/icon32.png" } },
+  "icons": { "16": "icons/icon16.png", "32": "icons/icon32.png", "48": "icons/icon48.png", "128": "icons/icon128.png" }
+}

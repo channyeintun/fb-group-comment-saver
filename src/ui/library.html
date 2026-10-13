@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Saved comments · FB Comment Saver</title>
+    <link rel="stylesheet" href="./common.css" />
+    <link rel="stylesheet" href="./library.css" />
+    <script type="module" src="./library.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#detail">Skip to comments</a>
+    <header class="topbar">
+      <div class="tb-brand">
+        <svg class="brand-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+          <rect width="24" height="24" rx="6" fill="currentColor" />
+          <path d="M6 7.5A1.5 1.5 0 0 1 7.5 6h9A1.5 1.5 0 0 1 18 7.5v6a1.5 1.5 0 0 1-1.5 1.5H11l-3.2 2.6a.5.5 0 0 1-.8-.4V15h0A1 1 0 0 1 6 14z" fill="#fff" />
+          <path d="M12 8.2v4.3m0 0-1.8-1.8M12 12.5l1.8-1.8" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+        <div class="tb-titles">
+          <h1>Saved comments</h1>
+          <p id="stats" class="tb-stats" aria-live="polite">Loading…</p>
+        </div>
+      </div>
+
+      <div class="tb-search" role="search">
+        <svg class="search-icon" viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.5" stroke="currentColor" stroke-width="1.5" fill="none" /><path d="m10.5 10.5 3 3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" /></svg>
+        <label for="search" class="visually-hidden">Search all saved comments</label>
+        <input id="search" class="input search-input" type="search" placeholder="Search comments and authors…" autocomplete="off" spellcheck="false" aria-keyshortcuts="/" />
+        <kbd class="kbd" aria-hidden="true">/</kbd>
+      </div>
+
+      <div class="tb-actions">
+        <div class="btn-group" role="group" aria-label="Export everything">
+          <span class="group-label">Export all</span>
+          <button class="btn btn-sm" type="button" data-export-all="json" aria-label="Export all as JSON">JSON</button>
+          <button class="btn btn-sm" type="button" data-export-all="csv" aria-label="Export all as CSV">CSV</button>
+          <button class="btn btn-sm" type="button" data-export-all="md" aria-label="Export all as Markdown">MD</button>
+        </div>
+        <button id="btn-clear" class="btn btn-sm btn-danger-ghost" type="button">Clear all</button>
+      </div>
+    </header>
+
+    <div class="layout">
+      <aside class="sidebar" aria-labelledby="posts-heading">
+        <div class="sb-head">
+          <h2 id="posts-heading">Posts</h2>
+          <span id="post-count" class="small muted"></span>
+        </div>
+        <div class="sb-tools">
+          <label for="filter" class="visually-hidden">Filter posts by text or author</label>
+          <input id="filter" class="input" type="search" placeholder="Filter posts…" autocomplete="off" spellcheck="false" />
+          <label for="sort" class="visually-hidden">Sort posts</label>
+          <select id="sort" class="select" title="Sort posts">
+            <option value="saved">Last saved</option>
+            <option value="posted">Posted date</option>
+            <option value="comments">Most comments</option>
+          </select>
+        </div>
+        <ul id="post-list" class="post-list" role="list" aria-labelledby="posts-heading"></ul>
+      </aside>
+
+      <main id="detail" class="detail" tabindex="-1" aria-busy="true"></main>
+    </div>
+
+    <p id="sr-status" class="visually-hidden" role="status" aria-live="polite"></p>
+    <div id="toast-region" class="toast-region" role="status" aria-live="polite"></div>
+  </body>
+</html>

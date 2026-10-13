@@ -1,0 +1,26 @@
+{
+  "name": "fb-group-comment-saver",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Chrome extension that saves comments from Facebook group posts, using Playwright (playwright-crx) for user actions.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "watch": "node build.mjs --watch",
+    "test": "node --test \"tests/unit/*.test.mjs\"",
+    "test:browser": "node --test \"tests/browser/*.test.mjs\"",
+    "test:e2e": "npm run build && node --test --test-concurrency=1 \"tests/e2e/*.test.mjs\"",
+    "test:all": "npm test && npm run test:browser && npm run test:e2e"
+  },
+  "dependencies": {
+    "playwright-crx": "0.15.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "fake-indexeddb": "^6.0.0",
+    "playwright": "^1.64.0"
+  }
+}

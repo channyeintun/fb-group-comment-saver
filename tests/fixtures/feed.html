@@ -1,0 +1,239 @@
+<!doctype html>
+<!--
+  FIXTURE feed.html: a Facebook group feed (SPEC §1 "Group feed", §4.4). Self-contained.
+  Served at https://www.facebook.com/groups/<slug>/ (slug fallback "testgroup") or via setContent.
+
+  EXPECTED TOTALS:
+    posts            : 30, ids 1001..1030 in DOM order, linking to /groups/<slug>/posts/<id>/
+                       (time link text "1h".."23h" for 1001..1012, then "2d".."19d").
+    initial render   : 5 posts (1001..1005); +5 appended (250 ms) whenever the page is scrolled to
+                       within 1200 px of the bottom, until 30.
+    virtualization   : a post whose bottom is more than 2500 px above the viewport keeps its
+                       [role=article] wrapper but its content is emptied (no text, no links); it is
+                       restored when it comes back within range.
+    lazy permalink   : post 1013 has href="#" on its time link ("2d") until that link gets
+                       mouseover/focus; its preview comment links to /posts/1013/?comment_id=… and must
+                       NOT be taken as the post permalink. Its body also links another group post
+                       (/posts/5555/, a pasted URL inside story_message) that must never be taken as
+                       its permalink either: post 5555 is never collected.
+    comment counts   : "Leave a comment" shows ((i*7) % 23) + 1 for index i = id - 1001, except every
+                       4th post (1004, 1008, … i % 4 == 3) which has 0 comments (empty button text)
+                       while its Like button still shows a number.
+    preview comments : posts with an even index and comments > 0 have one comment article
+                       ("Comment by …") plus "View more comments" when they have > 1 comment.
+    authors          : rotate through 7 names (index % 7); "Chai_lover🍵" has an emoji <img alt>.
+-->
+<html lang="en" dir="ltr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Test Group | Facebook</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    font: 15px/1.34 system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans Myanmar", "Myanmar Text", Padauk, sans-serif;
+    color: #050505; background: #f0f2f5;
+  }
+  a { color: inherit; text-decoration: none; }
+  .banner { position: sticky; top: 0; height: 56px; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.2);
+    display: flex; align-items: center; padding: 0 16px; font-weight: 700; font-size: 24px; color: #0866ff; z-index: 2; }
+  .main { width: 680px; max-width: calc(100vw - 32px); margin: 0 auto; padding: 16px 0 64px; }
+  .group-header { background: #fff; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  .group-header h1 { margin: 0 0 4px; font-size: 24px; }
+  .group-header .meta { color: #65676b; }
+  .card { background: #fff; border-radius: 8px; box-shadow: 0 1px 2px rgba(0,0,0,.2); padding: 12px 0; margin-bottom: 16px; min-height: 560px; }
+  .post-header { display: flex; gap: 8px; align-items: center; padding: 0 16px 8px; }
+  .post-meta { flex: 1; }
+  .post-meta h3 { margin: 0; font-size: 15px; }
+  .sub { color: #65676b; font-size: 13px; }
+  .avatar40 { width: 40px; height: 40px; flex: none; }
+  .avatar32 { width: 32px; height: 32px; flex: none; }
+  .post-menu { width: 36px; height: 36px; display: flex; align-items: center; justify-content: center; cursor: pointer; }
+  .story { padding: 0 16px 8px; }
+  .photo { height: 320px; background: linear-gradient(135deg, #cfd8dc, #90a4ae); }
+  .post-counts { display: flex; justify-content: space-between; padding: 8px 16px; border-bottom: 1px solid #ced0d4; color: #65676b; }
+  .post-counts [role=button] { min-width: 40px; min-height: 20px; cursor: pointer; }
+  .cmt { display: flex; gap: 6px; margin: 8px 16px 0; }
+  .bubble { display: inline-block; background: #f0f2f5; border-radius: 18px; padding: 8px 12px; }
+  .bubble .author { font-weight: 600; font-size: 13px; }
+  .bubble .time { font-size: 12px; color: #65676b; }
+  .bubble .text { display: block; }
+  .emoji { width: 16px; height: 16px; vertical-align: -3px; }
+  .cmt-actions { display: flex; gap: 12px; padding: 2px 12px; font-size: 12px; font-weight: 700; color: #65676b; }
+  .expander { display: inline-block; margin: 6px 16px 0; font-weight: 600; color: #65676b; cursor: pointer; }
+  .loading { height: 48px; margin: 0 auto 16px; width: 48px; border-radius: 50%; border: 4px solid #ced0d4; border-top-color: #0866ff; }
+</style>
+</head>
+<body>
+<div role="banner" class="banner">facebook</div>
+<div role="main" class="main">
+  <div class="group-header"><h1><a role="link" tabindex="0" class="js-group-link">Test Group</a></h1><div class="meta">Private group · 12.3K members</div></div>
+  <div role="feed" id="feed"></div>
+  <div role="progressbar" aria-label="Loading..." class="loading" id="loading" hidden></div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+  var m = location.pathname.match(/\/groups\/([^/]+)/);
+  var SLUG = (m && m[1]) || 'testgroup';
+  var ORIGIN = /(^|\.)facebook\.com$/.test(location.hostname) ? location.origin : 'https://www.facebook.com';
+  var TOTAL = 30, BATCH = 5, FIRST_ID = 1001, LAZY_ID = 1013, VIRTUALIZE_PX = 2500, NEAR_BOTTOM_PX = 1200;
+  var TRACK = '__cft__[0]=AZX&__tn__=%2CO%2CP-R';
+
+  function esc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+  var EMOJI_SRC = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><circle cx="8" cy="8" r="8" fill="#f7b928"/></svg>');
+  function E(alt) { return '<img alt="' + alt + '" width="16" height="16" class="emoji" src="' + EMOJI_SRC + '">'; }
+  function postUrl(id) { return ORIGIN + '/groups/' + SLUG + '/posts/' + id + '/'; }
+  function userUrl(uid) { return ORIGIN + '/groups/' + SLUG + '/user/' + uid + '/?' + TRACK; }
+
+  var AUTHORS = [
+    ['Kyaw Zin Thant', 100001],
+    ['Thura Min Oo', 100101],
+    ['Aye Chan Moe', 100102],
+    ['Chai_lover🍵', 100104, 'Chai_lover' + E('🍵')],
+    ['BrightOtter3141', 100199],
+    ['Min Thu', 100103],
+    ['Su Su Hlaing', 100105]
+  ];
+  var COMMENTERS = ['Ei Mon Kyaw', 'Zaw Min Oo', 'Thiri Aung', 'Nay Lin', 'Hnin Wai'];
+  var TEXTS = [
+    'Which backend framework do you recommend for a beginner?',
+    'မင်္ဂလာပါ။ React Native နဲ့ Flutter ဘယ်ဟာ ပိုကောင်းလဲ။',
+    'Sharing my notes on PostgreSQL indexing. Feedback welcome!',
+    'Is anyone hiring junior QA engineers in Yangon?',
+    'How do you prepare for system design interviews?',
+    'Free online course list for data engineering ' + E('📚'),
+    'What laptop do you use for Android development?',
+    'Remote work tips for developers in the Myanmar time zone',
+    'Kubernetes or Docker Swarm for a small team?',
+    'Weekly thread: share what you built this week!'
+  ];
+
+  function relTime(i) { return i < 12 ? (i * 2 + 1) + 'h' : (i - 10) + 'd'; }
+  function commentCount(i) { return i % 4 === 3 ? 0 : ((i * 7) % 23) + 1; }
+
+  var feed = document.getElementById('feed');
+  var loader = document.getElementById('loading');
+  var postIdOf = new WeakMap(); // article -> post id (used to fill the lazy href)
+  var saved = new WeakMap();    // virtualized article -> its saved innerHTML
+  var renderedCount = 0;
+  var loading = false;
+
+  function previewHtml(id, i, comments) {
+    if (!comments || i % 2 !== 0) return '';
+    var name = COMMENTERS[i % COMMENTERS.length];
+    var href = postUrl(id) + '?comment_id=' + (90000 + id) + '&__cft__[0]=AZX&__tn__=R]-R';
+    return '<div class="preview">' +
+      '<div role="article" aria-label="Comment by ' + esc(name) + ' 1 hour ago" tabindex="-1" class="cmt">' +
+        '<a role="link" tabindex="-1" class="avatar32" href="' + esc(userUrl(100300 + i)) + '"><svg width="32" height="32" aria-hidden="true"><circle cx="16" cy="16" r="16" fill="#bcc0c4"/></svg></a>' +
+        '<div><div class="bubble">' +
+          '<a role="link" tabindex="0" class="author" href="' + esc(userUrl(100300 + i)) + '"><span dir="auto">' + esc(name) + '</span></a>' +
+          '<span aria-hidden="true"> · </span>' +
+          '<a role="link" tabindex="0" class="time" aria-label="Wednesday 14 October 2026 at 00:10" href="' + esc(href) + '"><span dir="auto">1h</span></a>' +
+          '<span dir="auto" class="text"><div dir="auto">Great question, following.</div></span>' +
+        '</div>' +
+        '<div class="cmt-actions"><div role="button" tabindex="0" aria-label="Like">Like</div><div role="button" tabindex="0">Reply</div></div></div>' +
+      '</div>' +
+      (comments > 1 ? '<div role="button" tabindex="0" class="expander"><span>View more comments</span></div>' : '') +
+    '</div>';
+  }
+
+  function postEl(i) {
+    var id = FIRST_ID + i;
+    var a = AUTHORS[i % AUTHORS.length];
+    var name = a[0], uid = a[1], nameHtml = a[2] || esc(a[0]);
+    var lazy = id === LAZY_ID;
+    var permalink = lazy ? '#' : postUrl(id) + '?' + TRACK;
+    var likes = ((i * 5) % 17) + 1;
+    var comments = commentCount(i);
+    var shares = i % 3;
+
+    var unit = document.createElement('div');
+    var art = document.createElement('div');
+    art.setAttribute('role', 'article');
+    art.setAttribute('aria-labelledby', '_r_' + id + 'a_ _r_' + id + 'b_');
+    art.className = 'card';
+    art.innerHTML =
+      '<div class="post-header">' +
+        '<a role="link" tabindex="-1" aria-label="' + esc(name) + '" class="avatar40" href="' + esc(userUrl(uid)) + '"><svg width="40" height="40" aria-hidden="true"><circle cx="20" cy="20" r="20" fill="#8a8d91"/></svg></a>' +
+        '<div class="post-meta">' +
+          '<div data-ad-rendering-role="profile_name"><h3 id="_r_' + id + 'a_" dir="auto"><span><a role="link" tabindex="0" href="' + esc(userUrl(uid)) + '"><strong><span>' + nameHtml + '</span></strong></a></span></h3></div>' +
+          '<div class="sub" id="_r_' + id + 'b_"><span><a role="link" tabindex="0"' + (lazy ? ' class="js-lazy-time"' : '') + ' href="' + esc(permalink) + '"><span>' + relTime(i) + '</span></a></span>' +
+          '<span aria-hidden="true"> · </span><svg width="12" height="12" role="img" aria-label="Shared with Members of Test Group"><circle cx="6" cy="6" r="6" fill="#65676b"/></svg></div>' +
+        '</div>' +
+        '<div role="button" tabindex="0" aria-haspopup="menu" aria-expanded="false" aria-label="Actions for this post" class="post-menu"><svg width="20" height="20" aria-hidden="true"><circle cx="4" cy="10" r="2"/><circle cx="10" cy="10" r="2"/><circle cx="16" cy="10" r="2"/></svg></div>' +
+      '</div>' +
+      '<div data-ad-rendering-role="story_message" class="story"><div data-ad-preview="message" data-ad-comet-preview="message">' +
+        '<div dir="auto">' + TEXTS[i % TEXTS.length] + ' #' + (i + 1) + '</div>' +
+        (lazy ? '<div dir="auto">See also <a role="link" tabindex="0" href="' + esc(postUrl(5555) + '?' + TRACK) + '">' + esc(postUrl(5555)) + '</a></div>' : '') +
+        '</div></div>' +
+      '<div class="photo"></div>' +
+      '<div class="post-counts">' +
+        '<div data-ad-rendering-role="like_button"><div role="button" tabindex="0" aria-label="Like"><span>' + likes + '</span></div></div>' +
+        '<div data-ad-rendering-role="comment_button"><div role="button" tabindex="0" aria-label="Leave a comment"><span>' + (comments || '') + '</span></div></div>' +
+        '<div data-ad-rendering-role="share_button"><div role="button" tabindex="0" aria-label="Share"><span>' + (shares || '') + '</span></div></div>' +
+      '</div>' +
+      previewHtml(id, i, comments);
+    postIdOf.set(art, id);
+    unit.appendChild(art);
+    return unit;
+  }
+
+  function appendBatch() {
+    var end = Math.min(TOTAL, renderedCount + BATCH);
+    for (; renderedCount < end; renderedCount++) feed.appendChild(postEl(renderedCount));
+  }
+
+  /** Empty posts far above the viewport; restore them when they come back into range. */
+  function virtualize() {
+    Array.prototype.forEach.call(feed.children, function (unit) {
+      var art = unit.firstElementChild;
+      if (!art) return;
+      var r = art.getBoundingClientRect();
+      if (!saved.has(art) && r.bottom < -VIRTUALIZE_PX) {
+        saved.set(art, art.innerHTML);
+        art.style.height = r.height + 'px';
+        art.innerHTML = '';
+      } else if (saved.has(art) && r.bottom >= -VIRTUALIZE_PX) {
+        art.innerHTML = saved.get(art);
+        saved.delete(art);
+        art.style.height = '';
+      }
+    });
+  }
+
+  function maybeLoadMore() {
+    if (loading || renderedCount >= TOTAL) return;
+    var doc = document.scrollingElement || document.documentElement;
+    if (doc.scrollTop + innerHeight < doc.scrollHeight - NEAR_BOTTOM_PX) return;
+    loading = true;
+    loader.hidden = false;
+    setTimeout(function () {
+      loader.hidden = true;
+      appendBatch();
+      loading = false;
+      virtualize();
+      maybeLoadMore();
+    }, 250);
+  }
+
+  function fillLazyHref(e) {
+    var a = e.target && e.target.closest ? e.target.closest('a.js-lazy-time') : null;
+    if (a && a.getAttribute('href') === '#') {
+      a.setAttribute('href', postUrl(postIdOf.get(a.closest('[role="article"]'))) + '?' + TRACK);
+    }
+  }
+
+  document.querySelector('.js-group-link').setAttribute('href', ORIGIN + '/groups/' + SLUG + '/');
+  document.addEventListener('mouseover', fillLazyHref);
+  document.addEventListener('focusin', fillLazyHref);
+  window.addEventListener('scroll', function () { virtualize(); maybeLoadMore(); }, { passive: true });
+  appendBatch();
+})();
+</script>
+</body>
+</html>
