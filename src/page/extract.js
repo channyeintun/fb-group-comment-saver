@@ -21,6 +21,10 @@
  * @property {string|null} reactionLabel e.g. "5 reactions; see who reacted to this"
  * @property {boolean} truncated         a "See more" toggle is still present
  * @property {RawAttachment[]} attachments
+ * @property {string|null} fiberCommentId  React data (MAIN world only): comment.legacy_fbid — own id
+ * @property {string|null} fiberPostId     from comment.id = base64("comment:<postId>_<ownId>")
+ * @property {string|null} fiberAuthorId   comment.author.id when numeric
+ * @property {string|null} fiberAuthorName comment.author.name
  *
  * @typedef {object} RawPost
  * @property {string|null} permalinkHref
@@ -31,6 +35,7 @@
  * @property {string|null} dateAria
  * @property {string|null} commentCountText
  * @property {boolean} emptyState
+ * @property {string|null} fiberPostId  React data (MAIN world only): the feed story id's post id
  * @property {RawComment[]} items
  *
  * @typedef {object} RawExtraction
@@ -53,13 +58,20 @@
 export function extractRaw(opts) {
   const scope = opts && opts.scope === 'feed' ? 'feed' : 'auto';
 
-  const POST_SEL = '[role="article"]:not([aria-label])';
   const COMMENT_SEL = '[role="article"][aria-label]';
   const POST_LINK_RE = /\/groups\/[^/]+\/(posts|permalink)\/[\w.-]+/;
   const POST_ID_RE = /\/groups\/[^/]+\/(?:posts|permalink)\/([\w.-]+)/;
   // The post body. Links in it (pasted URLs, mentions) are never the post's own links.
   const MESSAGE_SEL =
     '[data-ad-rendering-role="story_message"], [data-ad-preview="message"], [data-ad-comet-preview="message"]';
+  // Post sub-parts (body, profile_name, like/comment/share buttons). Comments never own one; a post
+  // article does, with or without an aria-label.
+  const POST_PARTS_SEL = MESSAGE_SEL + ', [data-ad-rendering-role]';
+  // A container holding a post article (dialog/main root selection, SPEC §4): an article without
+  // aria-label, or one with post sub-parts. Same selector as pw-driver's root locators.
+  const ROOT_POST_SEL =
+    '[role="article"]:not([aria-label]), [role="article"] [data-ad-rendering-role], ' +
+    '[role="article"] [data-ad-preview="message"], [role="article"] [data-ad-comet-preview="message"]';
   // Relative time at the end of a comment aria-label ("… 2 days ago", "… 5h").
   const ARIA_TIME_TAIL = /\s+(?:just now|a few seconds ago|(?:\d+|an?)\s?[a-z]+(?:\s+ago)?)$/i;
   // First path segments that look like a vanity name but are never a profile.
@@ -76,17 +88,192 @@ export function extractRaw(opts) {
     return String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
   }
 
-  /** a.href as a string (SVG <a> elements expose an SVGAnimatedString). */
+  /**
+   * a.href as a string (SVG <a> elements expose an SVGAnimatedString); '' for a lazy link. Facebook
+   * renders some links as href "#" (or empty / javascript:) until hovered, and a.href resolves "#" to
+   * the page URL — which names the open post, and on a notification URL even carries ?comment_id=.
+   */
   function hrefOf(a) {
     if (!a) return '';
+    const raw = (a.getAttribute('href') || a.getAttribute('xlink:href') || '').trim();
+    if (!raw || raw.charAt(0) === '#' || /^javascript:/i.test(raw)) return '';
     const h = a.href;
     if (typeof h === 'string') return h;
-    return (h && h.baseVal) || a.getAttribute('href') || '';
+    return (h && h.baseVal) || raw;
   }
 
-  /** The element belongs to `article` itself, not to an article nested inside it. */
-  function ownedBy(el, article) {
-    return el.closest('[role="article"]') === article;
+  // ---- React fiber data (visible only from the page's MAIN world; null elsewhere) -------------
+
+  function fiberOf(el) {
+    try {
+      const key = Object.keys(el).find((k) => k.indexOf('__reactFiber$') === 0 || k.indexOf('__reactInternalInstance$') === 0);
+      return key ? el[key] : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function b64(s) {
+    if (typeof s !== 'string' || s.length < 8 || s.length > 400 || !/^[A-Za-z0-9+/=_-]+$/.test(s)) return null;
+    try {
+      return atob(s.replace(/-/g, '+').replace(/_/g, '/'));
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /** Post id of a feed story object: its id is base64 of "S:_I<digits>:VK:<postId>". */
+  function storyPostId(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    for (const key of ['id', '__id']) {
+      let v;
+      try {
+        v = value[key];
+      } catch (e) {
+        continue;
+      }
+      const m = /^S:_I\d+:VK:(\d+)/.exec(b64(v) || '');
+      if (m) return m[1];
+    }
+    return null;
+  }
+
+  /** Walks up the fiber tree from `el` (≤ 80 levels, never past `stopEl`'s fiber). */
+  function fiberPostId(el, stopEl) {
+    let f = fiberOf(el);
+    for (let i = 0; f && i < 80; i++) {
+      try {
+        if (stopEl && f.stateNode === stopEl) return null;
+        const props = f.memoizedProps;
+        if (props && typeof props === 'object') {
+          const keys = Object.keys(props).sort((a, b) => (b === 'feedUnit') - (a === 'feedUnit'));
+          for (const key of keys) {
+            let v;
+            try {
+              v = props[key];
+            } catch (e) {
+              continue;
+            }
+            const id = storyPostId(v);
+            if (id) return id;
+          }
+        }
+        f = f.return;
+      } catch (e) {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  /** memoizedProps.comment of a comment article's fiber (a few levels up), else null. */
+  function fiberComment(el) {
+    let f = fiberOf(el);
+    for (let i = 0; f && i < 6; i++) {
+      try {
+        const p = f.memoizedProps;
+        if (p && p.comment && typeof p.comment === 'object') return p.comment;
+        f = f.return;
+      } catch (e) {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  /** Fiber fields of a comment article; every field null when unavailable. */
+  function commentFiberFields(article) {
+    const out = { fiberCommentId: null, fiberPostId: null, fiberAuthorId: null, fiberAuthorName: null };
+    try {
+      const c = fiberComment(article);
+      if (!c) return out;
+      const own = c.legacy_fbid != null ? String(c.legacy_fbid) : '';
+      if (/^\d+$/.test(own)) out.fiberCommentId = own;
+      const m = /^comment:(\d+)_(\d+)/.exec(b64(String(c.id || '')) || '');
+      if (m) {
+        out.fiberPostId = m[1];
+        if (!out.fiberCommentId) out.fiberCommentId = m[2];
+      }
+      const author = c.author && typeof c.author === 'object' ? c.author : null;
+      if (author) {
+        const id = author.id != null ? String(author.id) : '';
+        if (/^\d+$/.test(id)) out.fiberAuthorId = id;
+        if (typeof author.name === 'string' && author.name.trim()) out.fiberAuthorName = author.name.trim();
+      }
+    } catch (e) {
+      // keep nulls
+    }
+    return out;
+  }
+
+  const postPartsCache = new Map();
+  /** The article owns a post sub-part (not one of a nested article). */
+  function ownsPostParts(article) {
+    if (postPartsCache.has(article)) return postPartsCache.get(article);
+    let result = false;
+    try {
+      result = Array.from(article.querySelectorAll(POST_PARTS_SEL)).some((el) => el.closest('[role="article"]') === article);
+    } catch (e) {
+      result = false;
+    }
+    postPartsCache.set(article, result);
+    return result;
+  }
+
+  const commentLikeCache = new Map();
+  /**
+   * A comment article: its own links carry comment_id, or its fiber has a `comment` prop — and it
+   * has no post sub-parts (body, like/comment buttons). Same rule as collectFeedPosts.
+   */
+  function isCommentLike(article) {
+    if (commentLikeCache.has(article)) return commentLikeCache.get(article);
+    let result = false;
+    try {
+      if (!ownsPostParts(article)) {
+        const own = (el) => el.closest('[role="article"]') === article;
+        result =
+          Array.from(article.querySelectorAll('a')).some((a) => own(a) && hrefOf(a).indexOf('comment_id') !== -1) ||
+          !!fiberComment(article);
+      }
+    } catch (e) {
+      result = false;
+    }
+    commentLikeCache.set(article, result);
+    return result;
+  }
+
+  /**
+   * A comment/reply article: no post sub-parts, and an aria-label (SPEC §1) or comment signals
+   * (isCommentLike). A post article owns post sub-parts whether or not it has an aria-label.
+   */
+  function isCommentArticle(article) {
+    return !ownsPostParts(article) && (article.hasAttribute('aria-label') || isCommentLike(article));
+  }
+
+  /** A post article for dialog/main roots: no aria-label, or an aria-label and post sub-parts. */
+  function isRootPost(article) {
+    return !article.hasAttribute('aria-label') || ownsPostParts(article);
+  }
+
+  /**
+   * The article an element belongs to: the nearest article above it that is `post` or not a
+   * comment (comment articles are flat, so a comment's owner is the post around it).
+   */
+  function owningArticle(el, post) {
+    let a = el.parentElement && el.parentElement.closest('[role="article"]');
+    while (a && a !== post && isCommentArticle(a)) a = a.parentElement && a.parentElement.closest('[role="article"]');
+    return a || null;
+  }
+
+  /**
+   * The element belongs to `container` itself: for an article, not to an article nested inside it;
+   * for a role-less feed post container, not to one of its comment articles.
+   */
+  function ownedBy(el, container) {
+    const a = el.closest('[role="article"]');
+    if (a === container) return true;
+    if (container.getAttribute('role') === 'article') return false;
+    return !a || !container.contains(a) || !isCommentLike(a);
   }
 
   function owned(article, selector) {
@@ -169,11 +356,46 @@ export function extractRaw(opts) {
     return feeds.find((f) => !f.closest('[role="dialog"]')) || feeds[0] || null;
   }
 
-  /** Post articles with no ancestor article inside `container`. */
+  /** Every [role=feed] outside dialogs (fallback: all), outermost only. */
+  function allFeeds() {
+    const all = Array.from(document.querySelectorAll('[role="feed"]'));
+    let feeds = all.filter((f) => !f.closest('[role="dialog"]'));
+    if (!feeds.length) feeds = all;
+    return feeds.filter((f) => !feeds.some((other) => other !== f && other.contains(f)));
+  }
+
+  /**
+   * Rendered feed posts with their feed (SPEC §4.2 container rules): top-level non-comment
+   * articles; a feed with content but no such article → its children (role-less post variant).
+   */
+  function feedPosts() {
+    const out = [];
+    for (const feed of allFeeds()) {
+      const articles = Array.from(feed.querySelectorAll('[role="article"]')).filter((a) => {
+        const ancestor = a.parentElement && a.parentElement.closest('[role="article"]');
+        return !(ancestor && feed.contains(ancestor)) && !isCommentLike(a);
+      });
+      let list = articles;
+      if (!articles.length && hasContent(feed)) {
+        let parent = feed;
+        for (let i = 0; i < 4; i++) {
+          const kids = Array.from(parent.children).filter(hasContent);
+          if (kids.length === 1 && kids[0].children.length > 1 && kids[0].getAttribute('role') !== 'article') {
+            parent = kids[0];
+          } else break;
+        }
+        list = Array.from(parent.children);
+      }
+      for (const post of list) if (hasContent(post)) out.push({ post, feed });
+    }
+    return out;
+  }
+
+  /** Post articles (isRootPost) with no ancestor article inside `container`. */
   function topLevelPosts(container) {
-    return Array.from(container.querySelectorAll(POST_SEL)).filter((p) => {
+    return Array.from(container.querySelectorAll('[role="article"]')).filter((p) => {
       const ancestor = p.parentElement && p.parentElement.closest('[role="article"]');
-      return !ancestor || !container.contains(ancestor);
+      return (!ancestor || !container.contains(ancestor)) && isRootPost(p);
     });
   }
 
@@ -193,7 +415,7 @@ export function extractRaw(opts) {
   /** SPEC §4 root selection: last dialog holding a post article, single-post main, feed, none. */
   function findRoot() {
     const dialogs = Array.from(document.querySelectorAll('[role="dialog"]')).filter((d) =>
-      d.querySelector(POST_SEL),
+      d.querySelector(ROOT_POST_SEL),
     );
     if (dialogs.length) return { kind: 'dialog', el: dialogs[dialogs.length - 1] };
     const main = document.querySelector('[role="main"]');
@@ -235,8 +457,7 @@ export function extractRaw(opts) {
   function extractComment(article, index) {
     const links = owned(article, 'a');
     const isCommentLink = (a) => hrefOf(a).indexOf('comment_id') !== -1;
-
-    const permA = links.find(isCommentLink) || null;
+    const fiber = commentFiberFields(article);
 
     // Body: span/div[dir=auto] outside links and buttons that holds div[dir=auto] paragraphs;
     // otherwise the candidate with the most text. Keep only the top-most matches.
@@ -262,6 +483,22 @@ export function extractRaw(opts) {
     const text = bodies.map(cachedText).filter(Boolean).join('\n');
     const inBody = (el) => bodies.some((b) => b.contains(el));
 
+    // Permalink: the timestamp link, a comment_id link outside the body (a link to another comment
+    // pasted in the text is never it). With React data, only a link naming the comment's own id
+    // (reply_comment_id, else comment_id): any other comment link belongs to something else.
+    const ownIdOf = (a) => {
+      try {
+        const u = new URL(hrefOf(a));
+        return u.searchParams.get('reply_comment_id') || u.searchParams.get('comment_id');
+      } catch (e) {
+        return null;
+      }
+    };
+    const permA =
+      links.find(
+        (a) => isCommentLink(a) && !inBody(a) && (!fiber.fiberCommentId || ownIdOf(a) === fiber.fiberCommentId),
+      ) || null;
+
     // Author: a link with text before the timestamp link and outside the body, that is a profile
     // link or carries the name from the aria-label. When the name is not a link (some anonymous
     // participants), nothing qualifies and normalize falls back to the aria-label: a later link
@@ -277,6 +514,19 @@ export function extractRaw(opts) {
         authorName = t;
         break;
       }
+    }
+
+    // Timestamp link without a permalink (href not filled in): a short link after the author that
+    // carries an aria-label (the absolute date) — used for the date only.
+    let timeA = permA;
+    if (!timeA) {
+      timeA =
+        links.find((a) => {
+          if (a === authorA || inBody(a) || !a.hasAttribute('aria-label')) return false;
+          if (authorA && !precedes(authorA, a)) return false;
+          const t = collapse(textOf(a));
+          return t.length > 0 && t.length <= 16 && (!authorName || t !== collapse(authorName));
+        }) || null;
     }
 
     const reactionEl =
@@ -329,18 +579,19 @@ export function extractRaw(opts) {
       authorName,
       authorHref: authorA ? hrefOf(authorA) || null : null,
       permalinkHref: permA ? hrefOf(permA) : null,
-      timeAria: permA ? permA.getAttribute('aria-label') : null,
-      timeText: permA ? collapse(textOf(permA)) || null : null,
+      timeAria: timeA ? timeA.getAttribute('aria-label') : null,
+      timeText: timeA ? collapse(textOf(timeA)) || null : null,
       text,
       left: Math.round(article.getBoundingClientRect().left),
       reactionLabel: reactionEl ? reactionEl.getAttribute('aria-label') : null,
       truncated,
       attachments,
+      ...fiber,
     };
   }
 
   /** @returns {RawPost} */
-  function extractPost(post, kind, scopeEl) {
+  function extractPost(post, kind, scopeEl, stopEl) {
     const story =
       ['[data-ad-rendering-role="story_message"]', '[data-ad-preview="message"]', '[data-ad-comet-preview="message"]']
         .map((sel) => owned(post, sel)[0])
@@ -408,10 +659,27 @@ export function extractRaw(opts) {
     }
 
     // Comment articles are flat (replies are not nested in their parent's article); each belongs
-    // to its closest enclosing post article.
+    // to the nearest article around it that is not a comment — the post, with or without an
+    // aria-label (a role-less feed post owns those not inside an article of its own). An
+    // aria-labelled article with post sub-parts is a post (e.g. a shared one), never a comment.
     const items = Array.from(post.querySelectorAll(COMMENT_SEL))
-      .filter((c) => (c.parentElement && c.parentElement.closest(POST_SEL)) === post)
+      .filter((c) => {
+        if (ownsPostParts(c)) return false;
+        const host = owningArticle(c, post);
+        return host === post || ((!host || !post.contains(host)) && post.getAttribute('role') !== 'article');
+      })
       .map((c, i) => extractComment(c, i));
+
+    // React data: the post's feed story id (walking up from the post, then its header links, then
+    // the dialog/main root).
+    let fiberPost = null;
+    const headerLinks = story ? links.filter((a) => precedes(a, story)) : links;
+    const starts = [post].concat(headerLinks.slice(0, 6));
+    if (kind !== 'feed' && scopeEl && scopeEl !== post) starts.push(scopeEl);
+    for (const start of starts) {
+      fiberPost = fiberPostId(start, stopEl || null);
+      if (fiberPost) break;
+    }
 
     return {
       permalinkHref: permA ? hrefOf(permA) : null,
@@ -422,6 +690,7 @@ export function extractRaw(opts) {
       dateAria: permA ? permA.getAttribute('aria-label') : null,
       commentCountText,
       emptyState: hasEmptyStateText(scopeEl, post),
+      fiberPostId: fiberPost,
       items,
     };
   }
@@ -430,12 +699,9 @@ export function extractRaw(opts) {
   /** @type {RawPost[]} */
   let posts = [];
   if (scope === 'feed') {
-    const feed = findFeed();
-    if (feed) {
+    if (findFeed()) {
       rootKind = 'feed';
-      posts = topLevelPosts(feed)
-        .filter(hasContent)
-        .map((p) => extractPost(p, 'feed', p));
+      posts = feedPosts().map(({ post, feed }) => extractPost(post, 'feed', post, feed));
     }
   } else {
     const root = findRoot();
@@ -444,9 +710,7 @@ export function extractRaw(opts) {
       const post = topLevelPosts(root.el)[0];
       if (post) posts = [extractPost(post, root.kind, root.el)];
     } else if (root.kind === 'feed') {
-      posts = topLevelPosts(root.el)
-        .filter(hasContent)
-        .map((p) => extractPost(p, 'feed', p));
+      posts = feedPosts().map(({ post, feed }) => extractPost(post, 'feed', post, feed));
     }
   }
 

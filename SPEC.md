@@ -34,6 +34,30 @@ These are facts, not guesses. Code must be built around them.
 - Live (2026-10-14): `collectFeedPosts` + scrolling found 25 unique posts in 7 scroll rounds with
   0 missing hrefs; quick-save `extractRaw` on the feed read 12 rendered posts and 8 preview comments,
   all with ids, dates and text.
+- Live (owner's account, re-verified): a feed post article is `[role=article]` with `aria-labelledby`,
+  **no** `aria-label`, **no** `aria-posinset`. Its header links, in order: avatar
+  `/groups/{g}/user/{n}/` (tabindex -1, no text), `/groups/{g}/user/{n}/` (aria-label, no text),
+  author `/groups/{g}/user/{n}/` (text), permalink `/groups/{g}/posts/{n}/?__cft__…` (short text like
+  "6h", has **both** `aria-label` and `aria-labelledby`).
+- **Markup differs per account** (A/B experiments): on another user's Mac (English UI, looks the same)
+  a group crawl found the feed (`[role=feed] [role=article]` present) but 0 post links in 6 scrolls.
+  Unverified candidates: header links stay `href="#"` until hovered (and lose it on mouseout), posts
+  without `role=article` or with an `aria-label`, several `[role=feed]`s, another extension rewriting
+  the DOM. Hence several id sources, language-independent rules, and "Copy diagnostics" (§4.5, §8).
+
+### React data (fibers) — verified live
+- React's fiber is reachable as `el[Object.keys(el).find(k => k.startsWith('__reactFiber$'))]` (walk
+  up with `.return`) **only from the page's MAIN world**. Expando properties are per JS world: from an
+  isolated world (`chrome.scripting.executeScript`'s default; content scripts) they are invisible.
+  Playwright's `page.evaluate` (pw-driver, playwright-crx) runs in the MAIN world;
+  `chrome.scripting.executeScript` needs `world: 'MAIN'`.
+- **Feed post**: walking up from the post article, at fiber depth ~14, `memoizedProps.feedUnit.id`
+  (also `feedUnit.__id`) is base64 of `"S:_I<digits>:VK:<postId>"`. The VK number equals the post id of
+  the permalink (18/18 posts); the `_I` number is NOT the group id — ignore it.
+- **Comment / reply article** (post dialog): ~4 fibers up, `memoizedProps.comment` has `legacy_fbid`
+  (own raw id: comment id for top-level, reply id = `reply_comment_id` for replies),
+  `id` = base64 of `"comment:<postId>_<ownId>"`, `author {id (numeric user id), name (as in the
+  aria-label)}`, `attachments`, `preferred_body`. No thread/parent field and no `created_time` there.
 - Post author: first `<a>` (not in a comment) whose href matches `/groups/<slug>/user/<userId>/` and
   has non-empty text. Anonymous participants appear with generated names (e.g. "BrightOtter3141").
 - Post sub-parts carry `data-ad-rendering-role`: `profile_name`, `story_message` (post body),
@@ -49,7 +73,8 @@ These are facts, not guesses. Code must be built around them.
 ### Post view (`/groups/<slug>/posts/<postId>/`)
 - Navigating to a post URL opens it as a **modal `[role="dialog"]`** over a feed (the feed's
   `[role="main"]` is still in the DOM behind it, with its own articles — must be ignored).
-  Pick the dialog that contains a `[role="article"]` without `aria-label`; if none, fall back to
+  Pick the dialog that contains a post article (`[role="article"]` without `aria-label`, or one with
+  post sub-parts — §4); if none, fall back to
   `[role="main"]` only when it shows a single post and no `[role="feed"]` (e.g. `/permalink/` layouts).
 - **Loading a post URL directly** (fresh navigation, e.g. `page.goto` in a crawl) shows the post as a
   dialog over the user's **home news feed**, not the group feed. Until the dialog mounts,
@@ -93,7 +118,8 @@ These are facts, not guesses. Code must be built around them.
   - `"Reply by <Author> to <Other>'s comment <relative time>"`
   - `"Reply by <Author> to <Other>'s reply <relative time>"` (reply to a reply)
   (English UI. Detection of comment articles must not depend on the text: "has aria-label" is enough;
-  posts use aria-labelledby.)
+  posts use aria-labelledby — and own post sub-parts (`data-ad-rendering-role`, story message), which
+  comments never do, so a post that also carries an aria-label on another account is still a post.)
 - Comment articles are **descendants of the post article** (19/19 in dialog; also in feed preview).
 - Replies are **NOT nested** inside their parent comment's article: all comment/reply articles are
   flat in DOM *pre-order* (a reply follows its parent; a reply-to-reply follows the reply).
@@ -145,12 +171,12 @@ These are facts, not guesses. Code must be built around them.
 ```
 package.json, build.mjs, README.md, .gitignore           [build]
 src/manifest.json                                         [build]
-src/page/extract.js   src/page/feed.js   src/page/probe.js[page]
+src/page/extract.js   src/page/feed.js   src/page/probe.js   src/page/diagnose.js   [page]
 tests/fixtures/*.html  tests/browser/page-scripts.test.mjs[page]
 tests/browser/driver.test.mjs                             [background]
 src/lib/constants.js  src/lib/settings.js                 [lib]
-src/lib/fb-url.js  src/lib/fb-date.js  src/lib/normalize.js  src/lib/export.js   [lib]
-tests/unit/{settings,fb-url,fb-date,normalize,export}.test.mjs [lib]
+src/lib/fb-url.js  src/lib/fb-date.js  src/lib/normalize.js  src/lib/export.js  src/lib/diagnostics.js   [lib]
+tests/unit/{settings,fb-url,fb-date,normalize,export,diagnostics}.test.mjs [lib]
 src/lib/db.js   tests/unit/db.test.mjs                    [db]
 src/background/service-worker.js  src/background/job-runner.js  src/background/pw-driver.js  [background]
 src/ui/common.js src/ui/common.css src/ui/sidepanel.{html,css,js} src/ui/library.{html,css,js} [ui]
@@ -250,8 +276,35 @@ returns JSON-serializable data; uses no `async` unless necessary (allowed — bo
 promises). Write each as `export function name(opts) { … }`.
 
 Shared DOM rules (re-implement inside each function as needed):
-- `isCommentArticle(el)`: `el.matches('[role="article"][aria-label]')`.
-- Post articles: `[role="article"]:not([aria-label])`.
+- Post sub-parts: `MESSAGE_SEL` and `[data-ad-rendering-role]` (body, profile_name, like/comment/share
+  buttons). A comment never owns one.
+- `isCommentArticle(el)`: `[role="article"][aria-label]` that owns no post sub-part (extractRaw's
+  comment items; probePage's `commentCount`; pw-driver's `COMMENT_SEL` =
+  `[role="article"][aria-label]:not(:has(<post sub-parts>))`).
+- Post articles (dialog/main root selection): `[role="article"]` **without** `aria-label`, or **with** one
+  and post sub-parts (some accounts may get aria-labelled posts, §1). A root holds one when it matches
+  `ROOT_POST_SEL` = `[role="article"]:not([aria-label]), [role="article"] <post sub-part>` (pw-driver:
+  `[role="dialog"]:has(…)` / `[role="main"]:has(…)`).
+- Comment ownership (extractRaw items): a comment belongs to the nearest article above it that is the
+  post itself or not a comment (`!ownsPostParts && (aria-label || comment-like)` is a comment) —
+  so a post with or without `aria-label` owns its comments; a role-less feed container owns those not
+  inside an article of its own.
+- Lazy links: an `<a>` whose raw `href` is empty, starts with `#` or is `javascript:` has **no** href
+  (`hrefOf` returns `''`): `a.href` would resolve `"#"` to the page URL, which names the open post and,
+  on a notification URL, even carries `?comment_id=`. Applies in every page function.
+- **Feed post containers** (collectFeedPosts, extractRaw's feed scope, diagnosePage): scan **every**
+  `[role="feed"]` not inside a `[role="dialog"]` (fallback: all feeds; nested feeds only once). Per
+  feed: top-level `[role="article"]`s (no ancestor article inside that feed) that are not
+  comment-like; a feed that has content but yields no such article → its children (role-less post
+  variant; a single wrapper child holding all posts is descended into). Only containers with content
+  count. Comment-like article = it owns no post sub-part (`MESSAGE_SEL`, `[data-ad-rendering-role]`)
+  **and** (its own links carry `comment_id`, or its fiber has `memoizedProps.comment` within 6 levels).
+- `ownedBy(el, container)`: for an article container `el.closest('[role="article"]') === container`;
+  for a role-less container: not inside a comment-like article of it.
+- React data: fibers as in §1 (key prefix `__reactFiber$`; older React's `__reactInternalInstance$` is
+  accepted too), every access in try/catch (never throw), walks capped at 80 levels and
+  stopped at the feed element's own fiber; ids are accepted only when numeric. Page functions that read
+  fibers return nulls when run outside the MAIN world.
 - `textOf(el)`: text with `<img alt>` substituted by alt, `<br>` → `\n`, each `div[dir=auto]`
   paragraph separated by `\n`, whitespace inside lines collapsed, lines trimmed, ≥3 blank lines → 1.
   Implement by recursive walk of child nodes (not innerText) so it works on off-screen/hidden nodes.
@@ -259,8 +312,8 @@ Shared DOM rules (re-implement inside each function as needed):
   toggle itself) from body text.
 - `ownedBy(el, article)`: `el.closest('[role="article"]') === article` (element belongs to that
   article and not to a nested one).
-- Root selection (`findRoot()`): the **last** `[role="dialog"]` that contains a
-  `[role="article"]:not([aria-label])` → kind `'dialog'`; else if URL path matches
+- Root selection (`findRoot()`): the **last** `[role="dialog"]` that contains a post article
+  (`ROOT_POST_SEL`) → kind `'dialog'`; else if URL path matches
   `/groups/[^/]+/(posts|permalink)/` and `[role="main"]` shows a single post — no `[role="feed"]`
   inside and exactly one top-level post article with content — → kind `'main'` (a `[role="main"]`
   holding a feed is the home/group feed behind a post dialog that has not mounted yet, §1);
@@ -300,7 +353,10 @@ RawPost = {
   dateAria: string|null,        // aria-label of the permalink link if present
   commentCountText: string|null,// innerText of post-owned [role=button][aria-label="Leave a comment"] if it has digits, else null
   emptyState: boolean,          // post-owned text node "No comments yet" exists
-  items: [ RawComment ]         // comment articles owned (closest post article) by this post, in DOM order
+  fiberPostId: string|null,     // React data: feed story id's VK post id, walking up from the post article,
+                                //   then its first header links, then (dialog/main) the root element
+  items: [ RawComment ]         // comment articles (isCommentArticle) owned by this post (comment ownership
+                                //   rule above), in DOM order
 }
 RawComment = {
   index: number,                // 0-based DOM order within the post
@@ -312,8 +368,13 @@ RawComment = {
                                 //   aria-label. null when none qualifies (name not a link): a mention, URL or
                                 //   hashtag link is never the author; normalize falls back to the aria-label.
   authorHref: string|null,
-  permalinkHref: string|null,   // a.href of the first comment-owned <a> whose href contains 'comment_id'
-  timeAria: string|null,        // that link's aria-label
+  permalinkHref: string|null,   // a.href of the first comment-owned, non-lazy <a> whose href contains
+                                //   'comment_id', outside the body (a pasted link to another comment is
+                                //   never it) and — when fiberCommentId is known — whose own id
+                                //   (reply_comment_id, else comment_id) equals fiberCommentId
+  timeAria: string|null,        // that link's aria-label (without a permalink: the first comment-owned link
+                                //   after the author, outside the body, with an aria-label and 1–16 chars of
+                                //   text other than the author name — the href-less timestamp link)
   timeText: string|null,        // that link's collapsed text, e.g. "2d"
   text: string,                 // body: comment-owned span[dir=auto] or div[dir=auto] that (a) is not inside an <a>,
                                 //   (b) not inside [role=button], (c) contains a div[dir=auto] child OR is the
@@ -322,6 +383,11 @@ RawComment = {
   left: number,                 // Math.round(article.getBoundingClientRect().left)
   reactionLabel: string|null,   // aria-label of a comment-owned element with aria-label matching /\breactions?\b/i
   truncated: boolean,           // a comment-owned [role=button] matching ^see more$ exists
+  fiberCommentId: string|null,  // React data (null when unavailable): comment.legacy_fbid (own id); else the
+                                //   <ownId> of comment.id = base64("comment:<postId>_<ownId>")
+  fiberPostId: string|null,     // <postId> from that comment.id
+  fiberAuthorId: string|null,   // comment.author.id when numeric
+  fiberAuthorName: string|null, // comment.author.name
   attachments: [ {type:'image'|'video'|'link', src?:string, href?:string, alt?:string} ]
                                 // images: comment-owned <img> not inside [role=button], not inside the avatar/author
                                 //   link, and (width||naturalWidth) > 32 → {type:'image', src:img.currentSrc||img.src, alt};
@@ -330,26 +396,54 @@ RawComment = {
                                 //   → {type:'link', href: decoded `u` param}
 }
 ```
-`extractRaw` must never click, scroll, or mutate the DOM.
+`extractRaw` must never click, scroll, or mutate the DOM. Feed-scope posts follow the feed container
+rules above (all feeds, role-less fallback).
 
 ### 4.2 `collectFeedPosts(opts)` — `src/page/feed.js`
-`opts = { markHoverFrom?: number }`. Scans currently rendered top-level `[role="feed"]` post articles
-with non-empty content. Returns:
+`opts = { markHoverFrom?: number }`. Scans the currently rendered feed post containers (§4 container
+rules: every non-dialog `[role="feed"]`, role-less fallback). Never throws. Returns:
 ```js
-{ posts: [ { permalinkHref, postId, authorName, textPreview /*first 160 chars*/, dateText,
-             commentCountText } ],
-  missing: [ { hoverId: string } ],   // rendered posts without a permalink: for each, set attribute
-                                      // data-fbcs-hover="<hoverId>" on its best candidate header link
-                                      // (post-owned <a> whose text matches ^\d+\s?[smhdwy]$ or a date, or
-                                      // which has an aria-label) so the driver can hover it to populate the href
-  feedFound: boolean, renderedCount: number }
+{ posts: [ { permalinkHref /* string|null */, postId, idSource, authorName,
+             textPreview /*first 160 chars*/, dateText, commentCountText } ],
+  missing: [ { hoverId: string } ],   // rendered posts with no id from any source and not hovered yet
+                                      // (no header link carries data-fbcs-hover-tried): for each, set
+                                      // attribute data-fbcs-hover="<hoverId>" on its best hover candidate
+  feedFound: boolean, renderedCount: number,
+  groupSlug: string|null,             // decoded /groups/<slug> of location.pathname
+  diag: { feeds, rendered, containerMode: 'article'|'children',
+          idSources: { link, hover, react, linkAny, comments }, missing, hoverCandidates,
+          sampleShapes /* ≤ 3 posts without an id */ } }
 ```
-`permalinkHref` follows the feed rule of §4.1: a header link (outside and before the post body)
-matching `/posts/<id>` or `/permalink/<id>` without comment_id, preferring one whose text is a time
-or date (dates need an English month name, so an author named "Phyo 7" is not a date). A post whose
-header link is still lazy is reported in `missing` (never identified through a body/attachment link).
-`postId` = the id segment from `/posts/<id>` or `/permalink/<id>`. hoverIds are
-`String((opts.markHoverFrom||0) + i)`. This function may set `data-fbcs-hover` attributes (its only
+Post id sources, in order (`idSource`):
+1. `'link'`: the feed rule of §4.1 — a header link (outside and before the post body) whose href is
+   not lazy and matches `/posts/<id>` or `/permalink/<id>` without comment_id, preferring one whose
+   text is a time or date (dates need an English month name, so an author named "Phyo 7" is not a
+   date). `permalinkHref` is set only for this source.
+2. `'hover'`: a header link carrying `data-fbcs-post-id` (the driver read its href while hovering it;
+   Facebook may clear the href again on mouseout).
+3. `'react'`: fiber walk (≤ 80 levels, stopping at the feed's fiber) from the container, then its
+   first 6 header links: any `memoizedProps` value object (`feedUnit` first) whose string `id`/`__id`
+   is base64 of `/^S:_I\d+:VK:(\d+)/`.
+4. `'link-any'`: other post-owned, non-lazy, non-comment links outside the body naming one post —
+   header links matching `/groups/x/(posts|permalink)/<id>`, `multi_permalinks=`, `story_fbid=`,
+   `set=pcb.<id>`, `set=gm.<id>`; links after the body only for `set=pcb.`/`set=gm.` (the post's own
+   photos; a shared post's `/posts/` link is never taken). All candidates must agree.
+5. `'comments'`: the majority post id of the preview comments, **one vote per comment article**: its
+   fiber id (`"comment:<postId>_"`), else its first comment link (`/posts/<id>/?comment_id=`, outside
+   the post body — the timestamp, which precedes the comment's text, so links pasted in a comment
+   cannot outvote); a comment link outside any comment article votes on its own.
+A body/attachment link is never the permalink. Hover candidates (only for posts with no id;
+language-independent): header links, lazy ones (`#`/empty/`javascript:`) or ones that are not
+profile/user or group-root links; scored aria-labelledby (4) + lazy href (2) + 1–24 chars of text (1);
+the best is marked. A post whose header holds a link marked `data-fbcs-hover-tried` (the driver hovered
+it already) gets no hoverId — hovering scrolls back to the post, so a post that never yields an id
+must not pin the scroll position every round — but still counts in `diag.missing`. hoverIds are `String((opts.markHoverFrom||0) + i)`. `dateText` = the permalink's
+text, else the first header link whose text is a time/date. `diag` is privacy-safe: `sampleShapes`
+hold container flags (role, aria-label?, aria-labelledby?, aria-posinset?, body?, fiber?) and up to 8
+header-link shapes `{where, href, text, ariaLabel, labelledby, tabindex}` — href as a masked shape
+(`"#"` kept; path with the group segment → `{g}`, digit runs ≥ 5 → `{n}`, unknown segments → `{s}`;
+query KEYS only, `__` tracking keys dropped), text as `len<n>:<classes>` (digit/alpha/other/space/punct).
+Never names, text, ids or full URLs. This function may set `data-fbcs-hover` attributes (its only
 mutation).
 
 ### 4.3 `probePage(opts)` — `src/page/probe.js`
@@ -396,6 +490,20 @@ with a small inline `<script>` emulating behaviour:
   permalink href is `#` until `mouseover` of its time link (its body also links another group post
   that must never be taken as its permalink), each post with `aria-label="Leave a comment"`
   count button.
+- Markup variants (comma-separated `?variant=`, or `window.FBCS_FIXTURE_VARIANT` which the e2e harness
+  injects so canonical post URLs keep the variant): `feed.html` — `nohref` (header links `#`, never
+  filled; fake fiber `article['__reactFiber$test'] = {memoizedProps:{}, return:{memoizedProps:
+  {feedUnit:{id: btoa('S:_I999:VK:'+postId)}}, return:null}}`), `roleless` (posts are plain divs;
+  comment previews keep role=article + aria-label), `twofeeds` (an empty "Featured" feed first),
+  `hoverreset` (odd posts' time links get their href only while hovered), `arialabel` (post articles
+  also carry an aria-label), and the query param `?noid=<ids>` (with `nohref`: those posts get no fiber
+  either — nothing names them); `post-dialog.html` —
+  `nohref` (comment timestamp links without href; fiber `{comment:{legacy_fbid, id:
+  btoa('comment:'+post+'_'+id), author:{id, name}}}` 2 levels above each comment article),
+  `hash` (unfilled links are `href="#"`: the post header's links, and with `nohref` the comment
+  timestamp links), `arialabel` (the post articles carry an aria-label), `minus1` (see above), and
+  `?commentLinks=<post>_<comment>` (C2 links another post's comment in its body and in a link card
+  after it).
 Comment ids in `post-dialog.html`: post 1001 uses 2001…/3001…; any other post P prefixes them with
 "<digits of P>0" (post 1002: 2001 → 100202001) so a crawl over several posts gets unique ids.
 `tests/e2e/extension.test.mjs` [integration] loads `dist/` in Chromium with facebook.com routed to
@@ -408,9 +516,25 @@ Browser tests (Node `playwright` + Chromium, headless) load fixtures, drive them
 `tests/browser/driver.test.mjs` runs the real `waitForPostRoot`/`preparePost` (pw-driver.js bundled
 with esbuild, `playwright-crx` stubbed) against the fixture variants.
 
+### 4.5 `diagnosePage(opts)` — `src/page/diagnose.js`
+`opts = { expanderPattern?, seeMorePattern?, sortButtonPattern? }` (defaults built in). Self-contained,
+read-only, run in the MAIN world. Returns a privacy-safe structural report of the open page:
+`url` (host kind `www`/`web`/…, masked path shape, query keys), `lang`, `dir`, `viewport {w,h,dpr}`,
+`visibility`, `rootKind`, `counts` (feeds, feeds in dialogs, dialogs, dialogs with articles, mains,
+articles with aria-label / aria-labelledby / aria-posinset, story messages, comment_id links, post
+links, lazy links, nodes with a reachable fiber), `feeds` (≤ 4: in dialog?, children, container mode,
+containers, rendered, fiber?), `feedPosts` (first ≤ 5 feed containers) and `dialog.post` (the open
+post): container attributes present, story_message present, `data-ad-rendering-role` counts, header
+and after-body link shapes (as §4.2), fiber reachable / post id found (and depth), comment articles
+count with aria-label / permalink / fiber id / fiber author counts; `dialog.controls` and
+`page.controls`: role=button counts matching the expander / See more / sort patterns, menu buttons,
+and **text shapes** of buttons without aria-label; `page` also lists `<html>`/`<body>` attribute NAMES
+and `chrome-extension://` node count (other extensions). Absolutely no names, post/comment text,
+numeric ids (digit runs ≥ 5 masked) or full URLs.
+
 ---------------------------------------------------------------------------------------------------
 
-## 5. Pure libs — `src/lib/fb-url.js`, `fb-date.js`, `normalize.js`, `export.js`
+## 5. Pure libs — `src/lib/fb-url.js`, `fb-date.js`, `normalize.js`, `diagnostics.js`, `export.js`
 
 ### `fb-url.js`
 ```js
@@ -453,21 +577,29 @@ part is parsed. Unparseable → `{iso:null, approx:true}`. Local-time constructi
 export function normalizeExtraction(raw, { savedAt, fallbackGroupSlug, mode }) → { posts: PostRecord[], comments: CommentRecord[], warnings: string[] }
 ```
 Per RawPost:
-- `postId`, most trustworthy source first: (1) the post id most item `permalinkHref`s agree on
-  (comment links always carry the real numeric `/posts/<postId>/`); (2) `raw.pageUrl` **only** if
-  `raw.rootKind` is `'dialog'|'main'`; (3) the post's `permalinkHref` — a link found inside a post can
-  point at another post (a pasted URL, a shared post), so it decides only when (1)–(2) give nothing.
-  A post `permalinkHref` naming another post id is ignored with a warning. No id → skip post, add
-  warning.
+- `postId`, most trustworthy source first: (1)+(2) the post id most items agree on, **one vote per
+  item**: its `permalinkHref`'s post id (comment links always carry the real numeric
+  `/posts/<postId>/`), else its numeric `fiberPostId` — so one stray link cannot outvote the other
+  items' React ids; URL parts come from a link naming the winner, else it is a page-data id;
+  (3) `raw.pageUrl` **only** if `raw.rootKind` is `'dialog'|'main'`;
+  (4) the post's `permalinkHref` — a link found inside a post can point at another post (a pasted URL,
+  a shared post), so it decides only when (1)–(3) give nothing; (5) the post's numeric `fiberPostId`.
+  A React id that (3) or (4) confirms uses that URL's parts; otherwise a warning says the id came from
+  page data only. A post `permalinkHref` naming another post id is ignored with a warning. No id →
+  skip post, add warning `Skipped post #<i> by <author>: no post id found (<n> comments not saved).`
+  (author name with whitespace collapsed to one line).
 - `groupSlug`: from the same URL source; else `fallbackGroupSlug` (or the page URL's slug) — except
   when the source is a non-group URL (e.g. `permalink.php?story_fbid=…` on the home feed): then only
   the page URL's slug, so a friend's post is never filed under the default group. Without a slug the
-  post `url` (and comment permalinks) are the source href without tracking/comment params.
-- Comment `id` = `replyCommentId ?? commentId`; if no permalink → synthetic
+  post `url` (and comment permalinks) are the source href without tracking/comment params (`null` for
+  an id from React data).
+- Comment `id` = `replyCommentId ?? commentId ?? fiberCommentId` (React id only when numeric and the
+  item has no permalink); else synthetic
   `'h:' + postId + ':' + djb2(authorName + '|' + text + '|' + (timeAria||timeText))` (hex).
 - `threadId` = `commentId` (thread root) or the comment's own id when top-level. A reply without a
   permalink takes the `threadId` of the nearest previous top-level item (DOM is pre-order).
-- `isReply` = `!!replyCommentId` || `/^reply by /i.test(ariaLabel)`.
+- `isReply` = `!!replyCommentId` || `/^reply by /i.test(ariaLabel)` || (id from React data and the
+  item's indentation level > 0 — React data has no thread field; aria wording is English-only).
 - `depth`: distinct sorted `left` values among the post's items → index of item's `left`. If all
   `left` equal (or ≤0, e.g. not laid out) → `isReply ? (replyToKind==='reply' ? 2 : 1) : 0`.
   Clamp: top-level (not isReply) depth = 0; replies ≥ 1.
@@ -484,8 +616,12 @@ Per RawPost:
   `parseFbDate(timeText || ariaLabel, raw.extractedAt)`. `createdAtText` = `timeAria || timeText`.
 - `relativeTime` = `timeText`.
 - `reactionCount`: leading number of `reactionLabel` (`"5 reactions…"` → 5, `"1.2K reactions"` → 1200), else 0.
-- `authorId`/`authorUrl` via `parseFbUrl(authorHref)` + `canonicalProfileUrl`.
-- `permalink` = `canonicalCommentUrl(...)` when ids known else `stripTracking(permalinkHref)`.
+- `authorName` = `authorName || fiberAuthorName || <aria-label parse>`.
+- `authorId`/`authorUrl` via `parseFbUrl(authorHref)` + `canonicalProfileUrl`; else numeric
+  `fiberAuthorId` (url `profile.php?id=`).
+- `permalink` = `canonicalCommentUrl(...)` when ids known else `stripTracking(permalinkHref)`. For an id
+  from React data: top-level → `canonicalCommentUrl(slug, postId, id)`; reply →
+  `canonicalCommentUrl(slug, postId, threadId, id)` when the thread id is real (not synthetic).
 - attachments: hrefs/srcs kept as-is except `stripTracking` on `href`.
 - Post: `commentCountExpected` = integer parsed from `commentCountText` (supports "1.2K", "1,234"),
   else null. `postedAt` from `parseFbDate(dateAria || dateText, raw.extractedAt)`.
@@ -501,6 +637,21 @@ CommentRecord = { id, postId, groupSlug, threadId, parentId, depth, isReply, rep
   missingAt /* null */, previousTexts /* [] */ }
 ```
 `normalize` sets `firstSavedAt = lastSavedAt = savedAt`; the db preserves original `firstSavedAt`.
+
+### `diagnostics.js` (pure; no DOM, no chrome.*)
+```js
+export function maskDigits(s) → s with pfbid… ids replaced by '{pfbid}' and digit runs ≥ 5 by '{n}'
+export function urlShape(href) → 'fb:/groups/{g}/posts/{n}/?comment_id' style shape ('ext:' for other hosts)
+export function maskLogLine(msg) → "Post i/n: <url> (Author)" → "(author)" and
+                                   "Skipped post #i by Author: no post id found (n comments not saved)."
+                                   → "by (author): …" — both anchored on the fixed text around the name,
+                                   matching any character in it (line breaks, ": "); then URLs →
+                                   shapes, then maskDigits
+export function buildDiagnosticsReport({ version, userAgent, language, page, pageNote, job, now })
+  → { format: 'fb-comment-saver/diagnostics-v1', createdAt, extension, userAgent (masked), language,
+      page /* diagnosePage result */, pageNote, lastJob: { mode, status, phase, error, startedAt,
+      finishedAt, counters, log /* last 40, masked */ } | null }
+```
 
 ### `export.js` (pure; no DOM, no chrome.*)
 ```js
@@ -611,15 +762,17 @@ JobState = { id, mode, status: 'idle'|'running'|'stopping'|'done'|'stopped'|'err
   receiver" errors).
 - Keep-alive while running: call `chrome.runtime.getPlatformInfo()` every 20 s.
 - Modes:
-  - `quick`: `chrome.scripting.executeScript({target:{tabId}, func: extractRaw, args:[{scope:'auto'}]})`
-    → `normalizeExtraction` → `savePostBundle(..., {fullScan:false})` for each post. No debugger.
+  - `quick`: `chrome.scripting.executeScript({target:{tabId}, func: extractRaw, args:[{scope:'auto'}],
+    world: 'MAIN'})` (MAIN world so React data is visible, §1) → `normalizeExtraction` →
+    `savePostBundle(..., {fullScan:false})` for each post. No debugger.
     `fallbackGroupSlug` is the tab's (or the settings') group only on `group`/`post` tabs; else null.
   - `post`: tab URL must classify as `post` (else error "Open a post first"). Uses `pw-driver`:
     attach → `waitForPostRoot` → `processOpenPost` (expected post id = the tab URL's).
   - `crawl`: attach; unless `isGroupFeedUrl(tabUrl, settings)` (exactly the feed in the chosen sort —
     another group page such as /members, a member's posts, or another sort does not count) →
     `page.goto(buildGroupFeedUrl(settings))`; `collectFeedLinks` until `maxPosts`; drop posts
-    with `lastFullScanAt` within `skipSavedWithinHours` (if > 0); for each: `page.goto(url)` →
+    with `lastFullScanAt` within `skipSavedWithinHours` (if > 0); for each: log
+    `"Post i/n: <url> (<author>)"` (author whitespace collapsed to one line), `page.goto(url)` →
     `waitForPostRoot` → `processOpenPost` (expected id = the link's); per-post errors are logged,
     counted in `postsFailed`, and the crawl continues; abort entire crawl on `blocked` or
     `loginRequired`. At the end, if `returnToGroupAfterCrawl`, `page.goto(groupFeedUrl)`.
@@ -651,8 +804,9 @@ export async function collectFeedLinks(page, ctx) → [{ postId, url, authorName
 ```
 `preparePost` algorithm (respect `signal` between every step; `sleep` = `actionDelayMs` + jitter):
 1. `probePage` → abort with error if `loginRequired`/`blocked`. `root` locator =
-   `page.locator('[role="dialog"]:has([role="article"]:not([aria-label]))').last()` for dialog, else
-   `page.locator('[role="main"]')`. The root must stay on the page: it is checked (`root.count()`)
+   `page.locator('[role="dialog"]:has(<ROOT_POST_SEL>)').last()` for dialog, else
+   `page.locator('[role="main"]:has(<ROOT_POST_SEL>)').first()` (post articles with or without
+   aria-label, §4). The root must stay on the page: it is checked (`root.count()`)
    at the start of every round, before the expanders and before returning; gone → throw
    `POST_CLOSED_MSG`. So does a later probe whose `rootKind` differs (dialog closed → feed/none), and
    a comment count that drops to 0 after having been > 0. If the root changes from `'main'` to
@@ -690,12 +844,24 @@ export async function collectFeedLinks(page, ctx) → [{ postId, url, authorName
    or a comment count lower than an earlier round's.
 5. Close any `[role="menu"]` left open (Escape).
 
-`collectFeedLinks` algorithm: move mouse to viewport center; loop: `page.evaluate(collectFeedPosts,
-{markHoverFrom})` → add to ordered Map by postId; for `missing` hoverIds: `page.hover('[data-fbcs-hover="<id>"]')`
-then re-collect once; `page.mouse.wheel(0, 1600)`; `sleep`; stop when map size ≥ `maxPosts` or 6
-consecutive rounds without growth, or signal aborted. Return first `maxPosts`, URLs canonicalized via
-`canonicalPostUrl(groupSlug, postId)` (keeping the tab's host, e.g. web.facebook.com, is NOT
-needed — always www).
+`collectFeedLinks` algorithm: wait for the feed (`pageFeedReady`: a `[role=feed]` with an article
+or a child with text); move mouse to viewport center; loop: `page.evaluate(collectFeedPosts,
+{markHoverFrom})` → add to ordered Map by postId; for up to 10 `missing` hoverIds per round:
+`page.hover('[data-fbcs-hover="<id>"]')`, then **immediately** `page.evaluate(hoveredPostLink, id)`
+(self-contained: marks the link `data-fbcs-hover-tried`, reads its href, parses
+`/posts|permalink/<id>`, `multi_permalinks=`, `story_fbid=`; on success sets `data-fbcs-post-id` on the
+link so later scans know it — Facebook can clear the href on mouseout), once more after 200 ms if
+empty; a failed hover marks the link tried too (`markHoverTried`), so each post is hovered at most
+once; then re-collect once and move the mouse back; `page.mouse.wheel(0, 1600)`; `sleep`; stop when map size ≥ `maxPosts` or 6 consecutive rounds
+without growth, or signal aborted. Return first `maxPosts`, URLs canonicalized via
+`canonicalPostUrl(slug, postId)` with slug = the link's own slug, else the scan's `groupSlug` (the feed
+page's group), else the settings' group (keeping the tab's host, e.g. web.facebook.com, is NOT needed
+— always www). Diagnostics aggregated over rounds; always logs one summary line
+`"Feed scan: N posts seen — ids from links L, page data R, comment links C, hover H; M without an id."`
+(M = the largest number of posts without an id in one round's last scan; N = found + M)
+and, when no id was found, a warning with the masked scan details (feeds, rendered, containerMode,
+hoverCandidates, sampleShapes) and the hint "Click 'Copy diagnostics' in the side panel and send the
+report."
 
 ---------------------------------------------------------------------------------------------------
 
@@ -734,6 +900,15 @@ Design: compact, clean, system font stack, CSS variables in `common.css` with li
   actionDelayMs, maxExpandRounds, postTimeoutSec, returnToGroupAfterCrawl, advanced patterns
   (text inputs; validate regex on blur; show error inline), **Reset to defaults**. Saved via
   `saveSettings` on change (debounced).
+- **Copy diagnostics**: a button in the Progress card's footer (next to Dismiss) shown when a job ended
+  with an error/interruption or saved no post (`postsDone − postsFailed ≤ 0`), and always in the
+  Settings section ("Troubleshooting"). It runs `diagnosePage` on the panel's tab via
+  `chrome.scripting.executeScript({world:'MAIN'})` when that tab is a www/web.facebook.com page (else
+  only a `pageNote`), builds `buildDiagnosticsReport({version: chrome.runtime.getManifest().version,
+  userAgent, language, page, pageNote, job})` and copies the 2-space JSON with
+  `navigator.clipboard.writeText` → toast "Diagnostics copied — paste it in your message". If the
+  clipboard refuses, the JSON is shown in a read-only textarea under the button with "Select all" and
+  "Close" (built with `el()`/textContent, no innerHTML).
 - Live updates: `chrome.storage.onChanged` (session `jobState`) + `MSG.DB_CHANGED` → refresh stats.
 - Explain the yellow "started debugging this browser" bar in a one-line hint under the buttons.
 

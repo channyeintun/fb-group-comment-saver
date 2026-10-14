@@ -39,8 +39,14 @@ export function probePage(opts) {
     '^(view|see)( all| more| previous)?( \\d[\\d,.]*[km]?)?( more| previous)? (comments?|repl(y|ies)|answers?)\\b|^\\d[\\d,.]*[km]? (more )?repl(y|ies)$';
   const DEFAULT_SEE_MORE = '^see more$';
   const DEFAULT_SORT = '^(most relevant|newest|all comments|top comments|most recent|oldest)$';
-  const POST_SEL = '[role="article"]:not([aria-label])';
   const COMMENT_SEL = '[role="article"][aria-label]';
+  // Post sub-parts (body, profile_name, like/comment/share buttons): a comment never has one.
+  const POST_PARTS_SEL =
+    '[data-ad-rendering-role], [data-ad-preview="message"], [data-ad-comet-preview="message"]';
+  // A container holding a post article: one without aria-label, or one with post sub-parts.
+  const ROOT_POST_SEL =
+    '[role="article"]:not([aria-label]), [role="article"] [data-ad-rendering-role], ' +
+    '[role="article"] [data-ad-preview="message"], [role="article"] [data-ad-comet-preview="message"]';
   const LOADING_SEL = '[role="progressbar"], [data-visualcompletion="loading-state"]';
   const BLOCKED_RE =
     /temporarily blocked|can.t use this feature right now|going too fast|try again later|we limit how often/i;
@@ -79,10 +85,15 @@ export function probePage(opts) {
     return feeds.find((f) => !f.closest('[role="dialog"]')) || feeds[0] || null;
   }
 
+  /** A post article: no aria-label, or an aria-label and post sub-parts (comments have neither). */
+  function isPostArticle(a) {
+    return !a.hasAttribute('aria-label') || !!a.querySelector(POST_PARTS_SEL);
+  }
+
   function topLevelPosts(container) {
-    return Array.from(container.querySelectorAll(POST_SEL)).filter((p) => {
+    return Array.from(container.querySelectorAll('[role="article"]')).filter((p) => {
       const ancestor = p.parentElement && p.parentElement.closest('[role="article"]');
-      return !ancestor || !container.contains(ancestor);
+      return (!ancestor || !container.contains(ancestor)) && isPostArticle(p);
     });
   }
 
@@ -104,7 +115,7 @@ export function probePage(opts) {
 
   function findRoot() {
     const dialogs = Array.from(document.querySelectorAll('[role="dialog"]')).filter((d) =>
-      d.querySelector(POST_SEL),
+      d.querySelector(ROOT_POST_SEL),
     );
     if (dialogs.length) return { kind: 'dialog', el: dialogs[dialogs.length - 1] };
     const main = document.querySelector('[role="main"]');
@@ -211,7 +222,8 @@ export function probePage(opts) {
     loginRequired: loginVisible && root.kind === 'none',
     blocked,
     postArticleFound: !!post,
-    commentCount: rootEl ? rootEl.querySelectorAll(COMMENT_SEL).length : 0,
+    // Comment articles: aria-labelled ones that are not a post (an aria-labelled post has post parts).
+    commentCount: rootEl ? Array.from(rootEl.querySelectorAll(COMMENT_SEL)).filter((c) => !isPostArticle(c)).length : 0,
     expanderCount,
     seeMoreCount,
     sortLabel,

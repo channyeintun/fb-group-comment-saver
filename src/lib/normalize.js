@@ -13,10 +13,12 @@ import {
  * @typedef {{type: 'image'|'video'|'link', src?: string, href?: string|null, alt?: string}} Attachment
  * @typedef {{index: number, ariaLabel: string, authorName: string|null, authorHref: string|null,
  *   permalinkHref: string|null, timeAria: string|null, timeText: string|null, text: string, left: number,
- *   reactionLabel: string|null, truncated: boolean, attachments: Attachment[]}} RawComment
+ *   reactionLabel: string|null, truncated: boolean, attachments: Attachment[],
+ *   fiberCommentId?: string|null, fiberPostId?: string|null, fiberAuthorId?: string|null,
+ *   fiberAuthorName?: string|null}} RawComment
  * @typedef {{permalinkHref: string|null, authorName: string|null, authorHref: string|null, text: string,
  *   dateText: string|null, dateAria: string|null, commentCountText: string|null, emptyState: boolean,
- *   items: RawComment[]}} RawPost
+ *   fiberPostId?: string|null, items: RawComment[]}} RawPost
  * @typedef {{pageUrl: string, pageTitle: string, rootKind: 'dialog'|'main'|'feed'|'none',
  *   extractedAt: number, posts: RawPost[]}} RawExtraction
  *
@@ -106,34 +108,60 @@ function indentLevels(items) {
   return levels;
 }
 
-/**
- * Post id/slug, from the most trustworthy source:
- * 1. the post id most comment permalinks agree on (they always carry the real numeric /posts/<id>/);
- * 2. for an open post (dialog/main), the page URL;
- * 3. the post's own permalink — a link found inside the post can belong to something else (a link
- *    to another group post in the text, a shared post), so it only decides when 1–2 are missing.
- * A disagreeing post permalink is reported in `warnings`.
- * @returns {(ReturnType<typeof parseFbUrl> & {href: string})|null}
- */
-function resolvePostIds(rp, raw, warnings) {
-  /** @type {Map<string, {count: number, parts: any}>} */
-  const votes = new Map();
-  for (const it of rp.items || []) {
-    if (!it.permalinkHref) continue;
-    const p = parseFbUrl(it.permalinkHref);
-    if (!p.postId) continue;
-    const v = votes.get(p.postId);
-    if (v) v.count++;
-    else votes.set(p.postId, { count: 1, parts: { ...p, href: it.permalinkHref } });
-  }
-  let fromItems = null;
-  let best = 0;
-  for (const v of votes.values()) {
-    if (v.count > best) {
-      best = v.count;
-      fromItems = v.parts;
+/** Most frequent value (first seen wins a tie), or null. @param {string[]} values */
+function majority(values) {
+  /** @type {Map<string, number>} */
+  const counts = new Map();
+  let best = null;
+  let bestCount = 0;
+  for (const v of values) {
+    if (!v) continue;
+    const n = (counts.get(v) || 0) + 1;
+    counts.set(v, n);
+    if (n > bestCount) {
+      best = v;
+      bestCount = n;
     }
   }
+  return best;
+}
+
+/** A raw numeric id (React data) — never trust anything else from it. */
+const realId = (v) => (typeof v === 'string' && /^\d+$/.test(v) ? v : null);
+
+/**
+ * Post id/slug, from the most trustworthy source:
+ * 1–2. the post id most comments agree on, one vote per comment: its permalink's /posts/<id>/
+ *    (comment links always carry the real numeric id), else its React data (comment.id =
+ *    "comment:<postId>_<id>"). One stray link (e.g. a link to another post's comment that was taken
+ *    for a permalink) cannot outvote the other comments' React ids;
+ * 3. for an open post (dialog/main), the page URL;
+ * 4. the post's own permalink — a link found inside a post can belong to something else (a link
+ *    to another group post in the text, a shared post), so it only decides when 1–3 are missing;
+ * 5. the post's React data (feed story id).
+ * A disagreeing post permalink is reported in `warnings`. Ids from React data have `fromPageData`.
+ * @returns {(ReturnType<typeof parseFbUrl> & {href: string|null, fromPageData?: boolean})|null}
+ */
+function resolvePostIds(rp, raw, warnings) {
+  const items = rp.items || [];
+  /** @type {Map<string, any>} */
+  const partsById = new Map();
+  const votes = [];
+  for (const it of items) {
+    let id = null;
+    if (it.permalinkHref) {
+      const p = parseFbUrl(it.permalinkHref);
+      if (p.postId) {
+        id = p.postId;
+        if (!partsById.has(id)) partsById.set(id, { ...p, href: it.permalinkHref });
+      }
+    }
+    votes.push(id || realId(it.fiberPostId));
+  }
+  const itemsId = majority(votes);
+  // A URL's parts when a comment link names the winner; else the id from React data only.
+  const fromItems = itemsId ? partsById.get(itemsId) || fiberIds(itemsId) : null;
+
   let fromPage = null;
   if (raw.rootKind === 'dialog' || raw.rootKind === 'main') {
     const p = parseFbUrl(raw.pageUrl);
@@ -144,7 +172,12 @@ function resolvePostIds(rp, raw, warnings) {
     const p = parseFbUrl(rp.permalinkHref);
     if (p.postId) fromLink = { ...p, href: rp.permalinkHref };
   }
-  const chosen = fromItems || fromPage || fromLink;
+  const fiberPost = realId(rp.fiberPostId);
+  const fromFiberPost = fiberPost ? fiberIds(fiberPost) : null;
+
+  let chosen = fromItems || fromPage || fromLink || fromFiberPost;
+  // An id from React data that a URL confirms is not "page data only": keep the URL's parts.
+  if (chosen?.fromPageData) chosen = [fromPage, fromLink].find((x) => x && x.postId === chosen.postId) || chosen;
   if (chosen && fromLink && fromLink.postId !== chosen.postId) {
     warnings.push(
       `Post ${chosen.postId}: ignored a link to another post (${fromLink.postId}) found inside it; ` +
@@ -154,8 +187,14 @@ function resolvePostIds(rp, raw, warnings) {
   return chosen;
 }
 
+/** Id parts for a post id read from React data (no URL of its own). */
+function fiberIds(postId) {
+  return { host: null, groupSlug: null, postId, commentId: null, replyCommentId: null, userId: null, vanity: null, href: null, fromPageData: true };
+}
+
 /** The id source is a non-group URL (permalink.php?story_fbid=…, a profile post): not a group post. */
 function isNonGroupSource(ids) {
+  if (!ids.href) return false;
   try {
     return !/^\/groups\//.test(new URL(ids.href, 'https://www.facebook.com/').pathname);
   } catch {
@@ -207,13 +246,15 @@ function normalizeComments(items, { postId, groupSlug, refMs, savedAt }) {
   /** @type {CommentRecord[]} */
   const records = items.map((it, i) => {
     const ariaLabel = it.ariaLabel || '';
-    const authorName = it.authorName || authorFromAria(ariaLabel);
+    const authorName = it.authorName || it.fiberAuthorName || authorFromAria(ariaLabel);
     const text = it.text || '';
     const link = it.permalinkHref ? parseFbUrl(it.permalinkHref) : null;
     const commentId = link?.commentId || null;
     const replyCommentId = link?.replyCommentId || null;
+    // React data (MAIN world): the comment's own id when it has no permalink.
+    const fiberId = !commentId && !replyCommentId ? realId(it.fiberCommentId) : null;
 
-    let id = replyCommentId ?? commentId;
+    let id = replyCommentId ?? commentId ?? fiberId;
     if (!id) {
       synthetic++;
       id = `h:${postId}:${djb2(`${authorName ?? ''}|${text}|${it.timeAria || it.timeText || ''}`)}`;
@@ -226,18 +267,26 @@ function normalizeComments(items, { postId, groupSlug, refMs, savedAt }) {
     }
     usedIds.add(id);
 
-    const isReply = !!replyCommentId || /^reply by /i.test(collapse(ariaLabel));
-    const replyTo = isReply ? parseReplyTo(ariaLabel, authorName) : { name: null, kind: null };
-
     let depth = null;
     if (levels.length >= 2 && Number.isFinite(it.left) && it.left > 0) {
       depth = levels.findIndex((lv) => it.left >= lv.min && it.left <= lv.max);
     }
+    // Without a permalink, an id from React data says nothing about threads: an indented item is a
+    // reply too (the aria-label wording is English-only).
+    const isReply =
+      !!replyCommentId || /^reply by /i.test(collapse(ariaLabel)) || (!!fiberId && depth !== null && depth > 0);
+    const replyTo = isReply ? parseReplyTo(ariaLabel, authorName) : { name: null, kind: null };
+
     if (depth === null || depth < 0) depth = isReply ? (replyTo.kind === 'reply' ? 2 : 1) : 0;
     depth = isReply ? Math.max(1, depth) : 0;
 
     const date = parseFirstDate([it.timeAria, it.timeText, ariaLabel], refMs);
-    const { authorId, authorUrl } = authorFields(it.authorHref);
+    let { authorId, authorUrl } = authorFields(it.authorHref);
+    const fiberAuthorId = realId(it.fiberAuthorId);
+    if (!authorId && fiberAuthorId) {
+      authorId = fiberAuthorId;
+      if (!authorUrl) authorUrl = canonicalProfileUrl({ userId: fiberAuthorId, vanity: null });
+    }
 
     let permalink = null;
     if (commentId && groupSlug) permalink = canonicalCommentUrl(groupSlug, postId, commentId, replyCommentId);
@@ -275,6 +324,7 @@ function normalizeComments(items, { postId, groupSlug, refMs, savedAt }) {
       missingAt: null,
       previousTexts: [],
       _hasThread: !!commentId,
+      _fiberId: !!fiberId,
     };
   });
 
@@ -321,7 +371,19 @@ function normalizeComments(items, { postId, groupSlug, refMs, savedAt }) {
     if (!rec.parentId && rec.threadId !== rec.id) rec.parentId = rec.threadId;
   });
 
-  for (const rec of records) delete rec._hasThread;
+  // Canonical permalinks for comments identified by React data, once their thread is known.
+  for (const rec of records) {
+    if (!rec._fiberId || rec.permalink || !groupSlug) continue;
+    if (!rec.isReply) rec.permalink = canonicalCommentUrl(groupSlug, postId, rec.id);
+    else if (realId(rec.threadId) && rec.threadId !== rec.id) {
+      rec.permalink = canonicalCommentUrl(groupSlug, postId, rec.threadId, rec.id);
+    }
+  }
+
+  for (const rec of records) {
+    delete rec._hasThread;
+    delete rec._fiberId;
+  }
   return { records, synthetic };
 }
 
@@ -349,11 +411,18 @@ export function normalizeExtraction(raw, opts = {}) {
     const items = Array.isArray(rp.items) ? rp.items : [];
     const ids = resolvePostIds(rp, raw, warnings);
     if (!ids) {
-      const who = rp.authorName ? ` by ${rp.authorName}` : '';
+      // One line (a name can hold a badge line); diagnostics masks "by <name>" in this warning.
+      const who = collapse(rp.authorName) ? ` by ${collapse(rp.authorName)}` : '';
       warnings.push(`Skipped post #${index + 1}${who}: no post id found (${items.length} comments not saved).`);
       return;
     }
     const postId = /** @type {string} */ (ids.postId);
+    if (ids.fromPageData) {
+      warnings.push(
+        `Post ${postId}: no link names this post; its id was read from Facebook's page data. ` +
+          'Check it with "Open on Facebook" in the library.',
+      );
+    }
     // A post identified by a non-group URL (e.g. story_fbid on the home feed) is not filed under a
     // group unless the page itself is a group page.
     const nonGroup = !ids.groupSlug && isNonGroupSource(ids);
@@ -378,7 +447,7 @@ export function normalizeExtraction(raw, opts = {}) {
     const posted = parseFirstDate([rp.dateAria, rp.dateText], refMs);
     const { authorId, authorUrl } = authorFields(rp.authorHref);
     // Without a group: the id source's own URL (tracking and comment params removed).
-    const url = groupSlug ? canonicalPostUrl(groupSlug, postId) : postUrlFromHref(ids.href);
+    const url = groupSlug ? canonicalPostUrl(groupSlug, postId) : ids.href ? postUrlFromHref(ids.href) : null;
 
     posts.push({
       id: postId,

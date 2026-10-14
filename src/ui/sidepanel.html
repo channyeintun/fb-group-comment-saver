@@ -125,6 +125,7 @@
         </div>
         <div class="btn-row">
           <button id="btn-stop" class="btn btn-danger grow" type="button" hidden>Stop</button>
+          <button id="btn-diag-job" class="btn btn-sm" type="button" hidden title="Copy a privacy-safe report of this page’s structure and the job log (no names, text or ids) to send with a bug report">Copy diagnostics</button>
           <button id="btn-dismiss" class="btn btn-ghost btn-sm" type="button" hidden>Dismiss</button>
         </div>
         <p class="note">Keep this tab visible while saving — Facebook only loads comments in a visible tab.</p>
@@ -238,6 +239,18 @@
             <p id="sortAllItemPattern-error" class="field-error" hidden></p>
           </div>
         </details>
+
+        <fieldset class="group">
+          <legend>Troubleshooting</legend>
+          <p class="hint tight">
+            Something doesn’t work on your account? <strong>Copy diagnostics</strong> copies a report of how
+            Facebook built the active page and the last job’s log — structure only, no names, text or ids —
+            to paste into your bug report.
+          </p>
+          <div class="btn-row diag-row">
+            <button id="btn-diag" class="btn btn-sm" type="button" title="Copy a privacy-safe report of the active Facebook page and the last job (no names, text or ids)">Copy diagnostics</button>
+          </div>
+        </fieldset>
 
         <div class="settings-foot">
           <button id="btn-reset" class="btn btn-sm" type="button" title="Restore the defaults for the options in this section (group crawl fields are kept)">Reset to defaults</button>

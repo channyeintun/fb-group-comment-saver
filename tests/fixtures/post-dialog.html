@@ -8,6 +8,17 @@
     ids    : for post 1001 comment ids are exactly the numbers below; for any other post P they are
              prefixed with "<digits of P>0" (post 1002: 2001 -> 100202001) so ids stay unique.
     ?variant=minus1 : top-level comment C5 (2005, "Zaw Min Oo") is omitted (tests "missing" marking).
+    ?variant=nohref : comment timestamp links have no href (no permalink anywhere; the date stays in
+                      their aria-label). Each comment article carries a fake React fiber chain whose
+                      memoizedProps.comment (3 levels up) is {legacy_fbid: <own id>,
+                      id: btoa('comment:<postId>_<own id>'), author: {id: <uid>, name}}, readable from
+                      the MAIN world only (like Facebook's). Variants are comma-separated; the e2e
+                      harness can also set window.FBCS_FIXTURE_VARIANT before this script runs.
+    ?variant=hash   : links Facebook has not filled in render as href="#" instead of no href: the
+                      dialog post's header links (avatar, group, author, date) and, with nohref, the
+                      comment timestamp links. a.href of "#" is the page URL — never a permalink.
+    ?variant=arialabel : the dialog's post article (and the feed post behind it) carry an aria-label
+                      ("<author>'s post") like comments do; they still own data-ad-rendering-role parts.
     Timing / behaviour variants (query params, combinable; used by tests/browser/driver.test.mjs):
     ?loadMs=<ms>        every loader (expanders, lazy load, sort) takes <ms> instead of 300 ms
     ?keepLabel=1        expanders keep their label while loading, with a progressbar after them
@@ -18,6 +29,9 @@
                         (a post URL loaded directly), and its [role=main] must not be taken for the post
     ?feedbackDelay=<ms> the post's counts row and sort control render <ms> after load
     ?bodyLink=<id>      the post body contains a pasted link to another group post /posts/<id>/
+    ?commentLinks=<post>_<comment>  comment C2 links another post's comment
+                        (/posts/<post>/?comment_id=<comment>) twice: pasted in its body, and as a
+                        link-preview card after the body. Neither is C2's permalink.
     The dialog's "Close" button removes the dialog and goes back to the group feed with
     history.pushState (Facebook's SPA close).
 
@@ -187,7 +201,12 @@
   var POST_ID = pathMatch ? pathMatch[2] : '1001';
   var ORIGIN = /(^|\.)facebook\.com$/.test(location.hostname) ? location.origin : 'https://www.facebook.com';
   var PARAMS = new URLSearchParams(location.search);
-  var VARIANT = PARAMS.get('variant') || '';
+  var VARIANTS = (PARAMS.get('variant') || window.FBCS_FIXTURE_VARIANT || '').split(',');
+  var MINUS1 = VARIANTS.indexOf('minus1') !== -1;
+  var NOHREF = VARIANTS.indexOf('nohref') !== -1;
+  var HASH = VARIANTS.indexOf('hash') !== -1;
+  var ARIA_LABEL = VARIANTS.indexOf('arialabel') !== -1;
+  var COMMENT_LINKS = /^(\d+)_(\d+)$/.exec(PARAMS.get('commentLinks') || '');
   var LOAD_MS = Number(PARAMS.get('loadMs')) || 300;
   var KEEP_LABEL = PARAMS.get('keepLabel') === '1';
   var DUD_KEYS = ['C2', 'C3', 'C5', 'C6'].slice(0, Number(PARAMS.get('duds')) || 0);
@@ -306,16 +325,25 @@
     art.setAttribute('tabindex', '-1');
     art.className = 'cmt depth' + depthOf(key);
     var user = esc(userUrl(c.uid));
+    var body = c.body;
+    var extra = c.extra || '';
+    if (COMMENT_LINKS && key === 'C2') {
+      var other = ORIGIN + '/groups/' + SLUG + '/posts/' + COMMENT_LINKS[1] + '/?comment_id=' + COMMENT_LINKS[2];
+      body += P('Same question here: <a role="link" tabindex="0" href="' + esc(other + '&' + TRACK) + '">' + esc(other) + '</a>');
+      extra = '<a role="link" tabindex="0" class="link-card" href="' + esc(other + '&' + TRACK) + '">' +
+        '<div class="lc-img"></div><div class="lc-text"><span>FACEBOOK.COM</span><span>Another comment</span></div></a>' + extra;
+    }
+    var timeHref = NOHREF && key !== 'F1' ? (HASH ? ' href="#"' : '') : ' href="' + esc(commentHref(key)) + '"';
     art.innerHTML =
       '<a role="link" tabindex="-1" class="avatar32" href="' + user + '"><svg width="32" height="32" aria-hidden="true"><circle cx="16" cy="16" r="16" fill="#bcc0c4"/></svg></a>' +
       '<div class="cmt-main">' +
         '<div class="bubble">' +
           '<a role="link" tabindex="0" class="author" href="' + user + '"><span dir="auto">' + (c.nameHtml || c.name) + '</span></a>' +
           '<span aria-hidden="true"> · </span>' +
-          '<a role="link" tabindex="0" class="time" aria-label="' + esc(c.aria) + '" href="' + esc(commentHref(key)) + '"><span dir="auto">' + c.t + '</span></a>' +
-          (c.body ? '<span dir="auto" class="text">' + c.body + '</span>' : '') +
+          '<a role="link" tabindex="0" class="time" aria-label="' + esc(c.aria) + '"' + timeHref + '><span dir="auto">' + c.t + '</span></a>' +
+          (body ? '<span dir="auto" class="text">' + body + '</span>' : '') +
         '</div>' +
-        (c.extra || '') +
+        extra +
         '<div class="cmt-actions">' +
           '<div role="button" tabindex="0" aria-label="Hide or report this"><svg width="12" height="12" aria-hidden="true"><circle cx="6" cy="6" r="2"/></svg></div>' +
           '<div role="button" tabindex="0" aria-label="Like">Like</div>' +
@@ -325,6 +353,26 @@
           (c.reactions ? reactionsHtml(c.reactions) : '') +
         '</div>' +
       '</div>';
+    if (NOHREF && key !== 'F1') {
+      // Fake React fiber (MAIN world expando), as on Facebook: the comment props sit a few levels up.
+      art['__reactFiber$test'] = {
+        memoizedProps: { role: 'article' },
+        return: {
+          memoizedProps: { depth: depthOf(key) },
+          return: {
+            memoizedProps: {
+              comment: {
+                legacy_fbid: cid(c.n),
+                id: btoa('comment:' + POST_ID + '_' + cid(c.n)),
+                author: { id: String(c.uid), name: c.name },
+                preferred_body: null
+              }
+            },
+            return: null
+          }
+        }
+      };
+    }
     var seeMore = art.querySelector('.see-more');
     if (seeMore && c.full) {
       var body = art.querySelector('.text');
@@ -434,6 +482,10 @@
   document.querySelector('.js-group-link').setAttribute('href', ORIGIN + '/groups/' + SLUG + '/?__cft__[0]=AZX&__tn__=-UC%2CP-R');
   document.querySelector('.js-photo-link').setAttribute('href', ORIGIN + '/photo/?fbid=4001&set=gm.' + POST_ID + '&__cft__[0]=AZX&__tn__=EH-R');
   document.getElementById('post-photo').src = svgData(600, 340, '#b0bec5');
+  // ?variant=hash: the post header's links are not filled in yet (lazy href "#").
+  if (HASH) document.querySelectorAll('#post .post-header a').forEach(function (a) { a.setAttribute('href', '#'); });
+  // ?variant=arialabel: the post article has an aria-label, like a comment.
+  if (ARIA_LABEL) document.getElementById('post').setAttribute('aria-label', "Kyaw Zin Thant's post");
 
   var STORY_FIRST = P('Do you need a CS degree to become a software engineer in Myanmar? ' + E('🤔')) +
     (BODY_LINK ? P('Related: <a role="link" tabindex="0" href="' + esc(ORIGIN + '/groups/' + SLUG + '/posts/' + BODY_LINK + '/?__cft__[0]=AZX&__tn__=R]-R') + '">' +
@@ -448,7 +500,7 @@
   });
 
   ['C1', 'C2', 'C3', 'C4', 'C5'].forEach(function (key) {
-    if (key === 'C5' && VARIANT === 'minus1') return;
+    if (key === 'C5' && MINUS1) return;
     insertTop(key);
   });
 
@@ -543,7 +595,7 @@
   var behind = document.getElementById('behind-feed');
   var unit = document.createElement('div');
   unit.innerHTML =
-    '<div role="article" aria-labelledby="_r_b1_ _r_b2_" class="card">' +
+    '<div role="article" aria-labelledby="_r_b1_ _r_b2_"' + (ARIA_LABEL ? ' aria-label="Kyaw Zin Thant&#39;s post"' : '') + ' class="card">' +
       '<div class="post-header">' +
         '<a role="link" tabindex="-1" aria-label="Kyaw Zin Thant" class="avatar40" href="' + esc(userUrl(100001)) + '"><svg width="40" height="40" aria-hidden="true"><circle cx="20" cy="20" r="20" fill="#8a8d91"/></svg></a>' +
         '<div class="post-meta">' +

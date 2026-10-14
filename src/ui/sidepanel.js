@@ -6,6 +6,8 @@ import { MSG, JOB_STATE_KEY, SETTINGS_KEY, DEFAULT_SETTINGS } from '../lib/const
 import { getSettings, saveSettings, buildGroupFeedUrl } from '../lib/settings.js';
 import { classifyTabUrl } from '../lib/fb-url.js';
 import { getStats, getPost } from '../lib/db.js';
+import { buildDiagnosticsReport } from '../lib/diagnostics.js';
+import { diagnosePage } from '../page/diagnose.js';
 import {
   el,
   formatDate,
@@ -434,6 +436,9 @@ function renderJob(job) {
   stop.textContent = stopping ? 'Stopping…' : 'Stop';
   stop.title = stopping ? 'Finishing the current step, then stopping' : 'Stop after the current step';
   $('btn-dismiss').hidden = active;
+  // A job that ended without saving anything (or with an error): offer a report for the bug.
+  const savedNothing = num(j.postsDone) - num(j.postsFailed) <= 0;
+  $('btn-diag-job').hidden = active || !(j.status === 'error' || j.status === 'interrupted' || savedNothing);
 
   updateTabWarning();
 
@@ -570,6 +575,97 @@ async function showJobTab() {
   } catch (err) {
     showToast(`Couldn’t switch to the tab: ${errMsg(err)}`, { tone: 'danger' });
   }
+}
+
+// =============================================================================================
+// Diagnostics ("Copy diagnostics": privacy-safe page structure + last job, for bug reports)
+
+/** Runs diagnosePage on the panel's tab (MAIN world, so React data counts) when it is Facebook. */
+async function collectPageDiagnostics() {
+  const tab = await queryPanelTab();
+  const kind = classify(tab?.url || tab?.pendingUrl || '').kind;
+  if (tab?.id == null || !FB_KINDS.has(kind)) {
+    return { page: null, pageNote: `The active tab is not a www/web.facebook.com page (${kind}).` };
+  }
+  try {
+    const s = state.settings;
+    const [injection] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: diagnosePage,
+      args: [{ expanderPattern: s.expanderPattern, seeMorePattern: s.seeMorePattern, sortButtonPattern: s.sortButtonPattern }],
+      world: 'MAIN',
+    });
+    return { page: injection?.result ?? null, pageNote: injection?.result ? null : 'The page script returned nothing.' };
+  } catch (err) {
+    return { page: null, pageNote: `Could not read the page: ${errMsg(err)}` };
+  }
+}
+
+/** @param {HTMLButtonElement} btn */
+async function copyDiagnostics(btn) {
+  btn.disabled = true;
+  btn.setAttribute('aria-busy', 'true');
+  try {
+    const { page, pageNote } = await collectPageDiagnostics();
+    let version = null;
+    try {
+      version = chrome.runtime.getManifest().version;
+    } catch {
+      /* not available */
+    }
+    const report = buildDiagnosticsReport({
+      version,
+      userAgent: navigator.userAgent,
+      language: navigator.language,
+      page,
+      pageNote,
+      job: state.job,
+    });
+    const text = JSON.stringify(report, null, 2);
+    removeDiagnosticsFallback();
+    try {
+      await navigator.clipboard.writeText(text);
+      showToast('Diagnostics copied — paste it in your message', { tone: 'ok' });
+    } catch {
+      showDiagnosticsFallback(btn, text);
+      showToast('Couldn’t copy automatically — select the report below and copy it.', { tone: 'warn' });
+    }
+  } catch (err) {
+    showToast(`Couldn’t build the diagnostics: ${errMsg(err)}`, { tone: 'danger' });
+  } finally {
+    btn.disabled = false;
+    btn.removeAttribute('aria-busy');
+  }
+}
+
+function removeDiagnosticsFallback() {
+  for (const node of document.querySelectorAll('.diag-fallback')) node.remove();
+}
+
+/** Clipboard refused: show the report in a read-only text box under the button. */
+function showDiagnosticsFallback(btn, text) {
+  const area = /** @type {HTMLTextAreaElement} */ (
+    el('textarea', { class: 'input diag-text', readonly: true, spellcheck: 'false', 'aria-label': 'Diagnostics report' })
+  );
+  area.value = text;
+  const selectAll = () => {
+    area.focus();
+    area.select();
+  };
+  const box = el(
+    'div',
+    { class: 'diag-fallback' },
+    area,
+    el(
+      'div',
+      { class: 'btn-row' },
+      el('button', { class: 'btn btn-sm', type: 'button', onclick: selectAll }, 'Select all'),
+      el('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: removeDiagnosticsFallback }, 'Close'),
+    ),
+  );
+  const row = btn.closest('.btn-row') || btn;
+  row.after(box);
+  selectAll();
 }
 
 // =============================================================================================
@@ -913,6 +1009,10 @@ function bindEvents() {
   );
   for (const btn of exportButtons()) btn.addEventListener('click', () => onExport(btn));
   $('btn-reset').addEventListener('click', resetSettings);
+  for (const id of ['btn-diag', 'btn-diag-job']) {
+    const btn = /** @type {HTMLButtonElement} */ ($(id));
+    btn.addEventListener('click', () => copyDiagnostics(btn));
+  }
 
   for (const input of settingInputs()) {
     const isToggle = (input instanceof HTMLInputElement && input.type === 'checkbox') || input instanceof HTMLSelectElement;

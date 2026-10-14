@@ -25,9 +25,14 @@ import { DEFAULT_SETTINGS } from '../lib/constants.js';
 /** @typedef {any} Page  Playwright Page (playwright-crx or Node playwright — same API) */
 /** @typedef {any} Locator */
 
-const COMMENT_SEL = '[role="article"][aria-label]';
-const POST_DIALOG_SEL = '[role="dialog"]:has([role="article"]:not([aria-label]))';
-const POST_MAIN_SEL = '[role="main"]:has([role="article"]:not([aria-label]))';
+/** Post sub-parts (body, profile_name, like/comment/share buttons): a comment never has one. */
+const POST_PARTS_SEL = '[data-ad-rendering-role], [data-ad-preview="message"], [data-ad-comet-preview="message"]';
+/** Comment/reply articles: aria-labelled, without post sub-parts (some accounts' posts have an aria-label too). */
+const COMMENT_SEL = `[role="article"][aria-label]:not(:has(${POST_PARTS_SEL}))`;
+/** Holds a post article (SPEC §4): one without aria-label, or one with post sub-parts. */
+const HAS_POST_ARTICLE = `:has([role="article"]:not([aria-label]), [role="article"] :is(${POST_PARTS_SEL}))`;
+const POST_DIALOG_SEL = `[role="dialog"]${HAS_POST_ARTICLE}`;
+const POST_MAIN_SEL = `[role="main"]${HAS_POST_ARTICLE}`;
 /** Labels we must never click, whatever the patterns say (SPEC §10). */
 const FORBIDDEN_LABEL = /^(hide|reply|like|share|follow|join|send|write|comment|leave a comment)\b/i;
 /** An expander (per thread) that failed this many times in a row without loading anything is skipped. */
@@ -144,17 +149,19 @@ function pageViewport() {
  * group) feed there until the post's dialog mounts.
  */
 function pagePostRootState() {
-  const POST = '[role="article"]:not([aria-label])';
+  const PARTS = '[data-ad-rendering-role], [data-ad-preview="message"], [data-ad-comet-preview="message"]';
+  // A post article: no aria-label, or an aria-label and post sub-parts (comments have neither).
+  const isPost = (a) => !a.hasAttribute('aria-label') || !!a.querySelector(PARTS);
   const hasContent = (a) => (a.textContent || '').trim().length > 0 || !!a.querySelector('a[href], img');
   const visible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
   const topLevel = (container) =>
-    Array.from(container.querySelectorAll(POST)).filter((p) => {
+    Array.from(container.querySelectorAll('[role="article"]')).filter((p) => {
       const ancestor = p.parentElement && p.parentElement.closest('[role="article"]');
-      return !ancestor || !container.contains(ancestor);
+      return (!ancestor || !container.contains(ancestor)) && isPost(p);
     });
   const dialogs = Array.from(document.querySelectorAll('[role="dialog"]'));
   for (let i = dialogs.length - 1; i >= 0; i--) {
-    const art = dialogs[i].querySelector(POST);
+    const art = Array.from(dialogs[i].querySelectorAll('[role="article"]')).find(isPost);
     if (art) return hasContent(art) ? 'dialog' : 'loading';
   }
   const m = location.pathname.match(/\/groups\/[^/]+\/(?:posts|permalink)\/([\w.-]+)/);
@@ -209,9 +216,54 @@ function rootLoadingCount(el) {
   }).length;
 }
 
-/** True when the group feed has at least one rendered post article. */
+/** True when a group feed has rendered a post (an article, or a child with text for role-less posts). */
 function pageFeedReady() {
-  return !!document.querySelector('[role="feed"] [role="article"]');
+  return Array.from(document.querySelectorAll('[role="feed"]')).some(
+    (f) => !!f.querySelector('[role="article"]') || Array.from(f.children).some((c) => /\S/.test(c.textContent || '')),
+  );
+}
+
+/**
+ * Reads the href of a hovered header link (data-fbcs-hover) right away — Facebook can clear it
+ * again when the pointer leaves — and parses the post id it names. Self-contained page function.
+ */
+function hoveredPostLink(hoverId) {
+  const el = document.querySelector('[data-fbcs-hover="' + String(hoverId).replace(/["\\]/g, '') + '"]');
+  if (!el) return null;
+  // Hovered once: collectFeedPosts does not offer this post for hovering again (see markHoverTried).
+  el.setAttribute('data-fbcs-hover-tried', '1');
+  const raw = (el.getAttribute('href') || '').trim();
+  if (!raw || raw === '#' || /^javascript:/i.test(raw)) return null;
+  let href;
+  try {
+    href = new URL(raw, location.href).href;
+  } catch (e) {
+    return null;
+  }
+  if (/[?&](reply_)?comment_id=/.test(href)) return null;
+  const m = /\/groups\/([^/?#]+)\/(?:posts|permalink)\/([\w.-]+)/.exec(href);
+  const q = m ? null : /[?&](?:multi_permalinks|story_fbid)=(\d+)/.exec(href);
+  if (!m && !q) return null;
+  const postId = m ? m[2] : q[1];
+  // Remember it on the link: later scans see the id even after Facebook clears the href again.
+  el.setAttribute('data-fbcs-post-id', postId);
+  let slug = m ? m[1] : null;
+  try {
+    if (slug) slug = decodeURIComponent(slug);
+  } catch (e) {
+    // keep the raw segment
+  }
+  return { postId, groupSlug: slug, href };
+}
+
+/**
+ * Marks a hover target as tried when hovering it failed (hoveredPostLink marks the ones it reads).
+ * Hovering scrolls back to the post, so a post that never yields an id must be hovered only once,
+ * or it pins the feed's scroll position every round. Self-contained page function.
+ */
+function markHoverTried(hoverId) {
+  const el = document.querySelector('[data-fbcs-hover="' + String(hoverId).replace(/["\\]/g, '') + '"]');
+  if (el) el.setAttribute('data-fbcs-hover-tried', '1');
 }
 
 /**
@@ -238,12 +290,23 @@ function elementLabelState(el) {
     }
     break;
   }
+  // A post article: no aria-label, or an aria-label and post sub-parts (comments have neither).
+  const PARTS = '[data-ad-rendering-role], [data-ad-preview="message"], [data-ad-comet-preview="message"]';
+  const isPost = (a) => !a.hasAttribute('aria-label') || !!a.querySelector(PARTS);
+  const nearest = el.closest('[role="article"]');
+  let inPost = false;
+  for (let a = nearest; a; a = a.parentElement && a.parentElement.closest('[role="article"]')) {
+    if (isPost(a)) {
+      inPost = true;
+      break;
+    }
+  }
   return {
     connected: el.isConnected,
     text,
     key: `${text}@${anchor}`,
-    inComment: !!el.closest('[role="article"][aria-label]'),
-    inPost: !!el.closest('[role="article"]:not([aria-label])'),
+    inComment: !!nearest && !isPost(nearest),
+    inPost,
   };
 }
 
@@ -975,9 +1038,16 @@ export async function preparePost(page, ctx) {
 // ------------------------------------------------------------------------------------------------
 // collectFeedLinks
 
+/** Hover candidates tried per scroll round. */
+const MAX_HOVERS_PER_ROUND = 10;
+
 /**
- * Scroll the group feed and collect post links incrementally (the feed is virtualized).
- * Posts whose permalink is still lazy get hovered (data-fbcs-hover) so Facebook fills the href.
+ * Scroll the group feed and collect post ids incrementally (the feed is virtualized).
+ * collectFeedPosts finds ids from header links, React data, other post links or preview comments;
+ * posts still without an id get their header link hovered (data-fbcs-hover) so Facebook fills in
+ * the href, which is read at once (it can be cleared when the pointer leaves).
+ * Always logs a one-line summary of where the ids came from; when none were found, also a warning
+ * with the scan's privacy-safe diagnostics (shapes only, no names, text or ids).
  * @param {Page} page
  * @param {DriverCtx} ctx
  * @returns {Promise<Array<{postId: string, url: string, authorName: string|null, textPreview: string, dateText: string|null, commentCountText: string|null}>>}
@@ -985,9 +1055,13 @@ export async function preparePost(page, ctx) {
 export async function collectFeedLinks(page, ctx) {
   const { settings, signal, log, progress } = ctx;
   const maxPosts = settings.maxPosts;
-  const fallbackSlug = parseFbUrl(settings.groupUrl)?.groupSlug ?? null;
+  const settingsSlug = parseFbUrl(settings.groupUrl)?.groupSlug ?? null;
+  /** @type {string|null} the feed page's own group (from collectFeedPosts) */
+  let pageSlug = null;
   /** @type {Map<string, any>} */
   const found = new Map();
+  const sources = { link: 0, react: 0, linkAny: 0, comments: 0, hover: 0 };
+  const diag = { feeds: 0, rendered: 0, containerMode: 'article', missing: 0, hoverCandidates: 0, sampleShapes: /** @type {any[]} */ ([]) };
 
   // Wait for the feed (and detect login walls / blocks early).
   const feedDeadline = Date.now() + 30000;
@@ -1010,20 +1084,37 @@ export async function collectFeedLinks(page, ctx) {
   let noGrowth = 0;
   let round = 0;
 
-  const addPosts = (posts) => {
-    for (const p of posts || []) {
-      if (!p?.postId || found.has(p.postId)) continue;
-      const slug = (p.permalinkHref && parseFbUrl(p.permalinkHref)?.groupSlug) || fallbackSlug;
-      if (!slug) continue;
-      found.set(p.postId, {
-        postId: p.postId,
-        url: canonicalPostUrl(slug, p.postId),
-        authorName: p.authorName ?? null,
-        textPreview: p.textPreview ?? '',
-        dateText: p.dateText ?? null,
-        commentCountText: p.commentCountText ?? null,
-      });
+  /** @param {{postId: string, permalinkHref?: string|null, authorName?: string|null, textPreview?: string, dateText?: string|null, commentCountText?: string|null}} p @param {string} source @param {string|null} [slugHint] */
+  const addPost = (p, source, slugHint = null) => {
+    if (!p?.postId || found.has(p.postId)) return;
+    const slug = slugHint || (p.permalinkHref && parseFbUrl(p.permalinkHref)?.groupSlug) || pageSlug || settingsSlug;
+    if (!slug) return;
+    found.set(p.postId, {
+      postId: p.postId,
+      url: canonicalPostUrl(slug, p.postId),
+      authorName: p.authorName ?? null,
+      textPreview: p.textPreview ?? '',
+      dateText: p.dateText ?? null,
+      commentCountText: p.commentCountText ?? null,
+    });
+    const key = source === 'link-any' ? 'linkAny' : source;
+    if (key in sources) sources[/** @type {keyof typeof sources} */ (key)]++;
+  };
+
+  /** One scan: add its posts, merge its diagnostics. */
+  const scan = async () => {
+    const res = await evaluateWithRetry(page, collectFeedPosts, { markHoverFrom: hoverSeq }, signal);
+    hoverSeq += res?.missing?.length || 0;
+    if (res?.groupSlug && !pageSlug) pageSlug = res.groupSlug;
+    for (const p of res?.posts || []) addPost(p, p.idSource || 'link');
+    const d = res?.diag;
+    if (d) {
+      diag.feeds = Math.max(diag.feeds, d.feeds || 0);
+      diag.rendered = Math.max(diag.rendered, d.rendered || 0);
+      if (d.containerMode === 'children') diag.containerMode = 'children';
+      for (const shape of d.sampleShapes || []) if (diag.sampleShapes.length < 3) diag.sampleShapes.push(shape);
     }
+    return res;
   };
 
   while (found.size < maxPosts && noGrowth < 6) {
@@ -1031,27 +1122,45 @@ export async function collectFeedLinks(page, ctx) {
     round++;
     const before = found.size;
 
-    let res = await evaluateWithRetry(page, collectFeedPosts, { markHoverFrom: hoverSeq }, signal);
-    hoverSeq += res?.missing?.length || 0;
-    addPosts(res?.posts);
+    let res = await scan();
 
-    // Hover lazy permalinks (at most a few per round), then re-collect once.
-    const missing = (res?.missing || []).slice(0, 5);
+    // Hover the header links of posts still without an id; read each href at once.
+    const missing = (res?.missing || []).slice(0, MAX_HOVERS_PER_ROUND);
     if (missing.length && found.size < maxPosts) {
+      diag.hoverCandidates += missing.length;
       for (const m of missing) {
         throwIfAborted(signal);
+        const id = String(m.hoverId).replace(/"/g, '');
+        let hit = null;
         try {
-          await page.hover(`[data-fbcs-hover="${String(m.hoverId).replace(/"/g, '')}"]`, { timeout: 2000 });
-          await sleep(250, signal);
+          await page.hover(`[data-fbcs-hover="${id}"]`, { timeout: 2000 });
+          hit = await evaluateWithRetry(page, hoveredPostLink, id, signal);
+          if (!hit) {
+            await sleep(200, signal);
+            hit = await evaluateWithRetry(page, hoveredPostLink, id, signal);
+          }
+          if (hit) {
+            addPost({ postId: hit.postId, permalinkHref: hit.href }, 'hover', hit.groupSlug);
+          }
         } catch (err) {
           if (isAbortError(err) || isTargetClosedError(err)) throw err;
         }
+        // Hover each post at most once (hoveredPostLink marks the ones it read; this covers a
+        // failed hover): hovering scrolls back to it, so a post that never yields an id would
+        // otherwise pin the scroll position and stop the feed from growing.
+        if (!hit) {
+          await page.evaluate(markHoverTried, id).catch((err) => {
+            if (isTargetClosedError(err)) throw err;
+          });
+        }
       }
-      res = await evaluateWithRetry(page, collectFeedPosts, { markHoverFrom: hoverSeq }, signal);
-      hoverSeq += res?.missing?.length || 0;
-      addPosts(res?.posts);
+      res = await scan();
       await page.mouse.move(center.x, center.y);
     }
+    // Posts of this round still without an id: the last scan's count (a hovered post that gave its
+    // id carries data-fbcs-post-id, so the re-scan already counts it as found).
+    const unresolved = res?.diag?.missing ?? res?.missing?.length ?? 0;
+    diag.missing = Math.max(diag.missing, unresolved);
 
     noGrowth = found.size > before ? 0 : noGrowth + 1;
     progress({ phase: `Collecting posts from the feed: ${Math.min(found.size, maxPosts)}/${maxPosts}` });
@@ -1062,6 +1171,26 @@ export async function collectFeedLinks(page, ctx) {
   }
 
   const list = [...found.values()].slice(0, maxPosts);
+  log(
+    'info',
+    `Feed scan: ${found.size + diag.missing} posts seen — ids from links ${sources.link + sources.linkAny}, ` +
+      `page data ${sources.react}, comment links ${sources.comments}, hover ${sources.hover}; ` +
+      `${diag.missing} without an id.`,
+  );
+  if (!list.length) {
+    const report = {
+      feeds: diag.feeds,
+      rendered: diag.rendered,
+      containerMode: diag.containerMode,
+      hoverCandidates: diag.hoverCandidates,
+      sampleShapes: diag.sampleShapes,
+    };
+    log(
+      'warn',
+      `No post ids found in the feed. Scan details: ${JSON.stringify(report)}. ` +
+        "Click 'Copy diagnostics' in the side panel and send the report.",
+    );
+  }
   if (found.size < maxPosts) {
     log('info', `Feed stopped growing after ${round} scrolls: collected ${list.length} post link${list.length === 1 ? '' : 's'}.`);
   } else {

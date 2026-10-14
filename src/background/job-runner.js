@@ -332,10 +332,13 @@ async function runQuick(rc) {
   const tabKind = assertFacebookTab(tab.url);
   state.postsTotal = 1;
   progress({ phase: 'Reading visible comments', currentPostUrl: tab.url ?? null });
+  // MAIN world: Facebook's React data (fiber props on DOM nodes) is invisible from the isolated
+  // world, and some accounts get markup where only that data names the post/comment ids.
   const [injection] = await chrome.scripting.executeScript({
     target: { tabId: tab.id },
     func: extractRaw,
     args: [{ scope: 'auto' }],
+    world: 'MAIN',
   });
   const raw = injection?.result;
   if (!raw) throw new Error('Could not read the page (no result from the page script).');
@@ -434,7 +437,10 @@ async function runCrawl(rc) {
         const link = links[i];
         const prefix = `Post ${i + 1}/${links.length}: `;
         progress({ phase: `${prefix}opening`, currentPostUrl: link.url });
-        log('info', `${prefix}${link.url}${link.authorName ? ` (${link.authorName})` : ''}`);
+        // One line per post: a name can hold line breaks (a badge line under it), and diagnostics
+        // (src/lib/diagnostics.js) masks the "(name)" at the end of this line.
+        const author = collapse(link.authorName);
+        log('info', `${prefix}${link.url}${author ? ` (${author})` : ''}`);
         try {
           await page.goto(link.url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
           await waitForPostRoot(page, { timeoutMs: POST_LOAD_TIMEOUT_MS, signal });
@@ -587,6 +593,11 @@ function detachMessage(reason) {
 
 function logDebuggerHint() {
   log('info', 'Attached to the tab. Chrome shows a "started debugging this browser" bar while saving — don\'t click Cancel; keep the tab visible.');
+}
+
+/** Whitespace runs (line breaks included) → one space. @param {unknown} s */
+function collapse(s) {
+  return String(s ?? '').replace(/\s+/g, ' ').trim();
 }
 
 /** @param {string|undefined} url */

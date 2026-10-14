@@ -632,3 +632,146 @@ describe('parseCount', () => {
     assert.equal(parseCount(null), null);
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// React-data fallbacks (fiber fields): markup variants where comments have no permalink and/or
+// posts no header link (SPEC §1 live facts, §5).
+// ---------------------------------------------------------------------------------------------
+
+describe('normalizeExtraction: React data (fiber) fallbacks', () => {
+  /** Comments without permalinks, identified only by React data. Aria-labels are not English. */
+  function fiberItems(postId = POST_ID) {
+    const fiber = (index, own, uid, name, left, extra = {}) =>
+      item(index, {
+        ariaLabel: `Kommentar von ${name}`,
+        timeAria: null,
+        timeText: '2 Std.',
+        text: `text ${index}`,
+        left,
+        fiberCommentId: own,
+        fiberPostId: postId,
+        fiberAuthorId: uid,
+        fiberAuthorName: name,
+        ...extra,
+      });
+    return [
+      fiber(0, C1, '100004444444444', 'Thura Min Oo', 370),
+      fiber(1, R1, '100005555555555', 'Snow2Rain2', 431),
+      fiber(2, R2, '100004444444444', 'Thura Min Oo', 473),
+      fiber(3, C2, '100006666666666', 'Chai_lover🍵', 370),
+      fiber(4, R4, '100007777777777', 'Back to Basics', 431),
+    ];
+  }
+  const dialogRaw = (items, extra = {}) => ({
+    pageUrl: `${BASE}/posts/${POST_ID}/`,
+    pageTitle: 'x',
+    rootKind: 'dialog',
+    extractedAt: EXTRACTED_AT,
+    posts: [{ permalinkHref: null, authorName: 'Op', authorHref: null, text: 'post', dateText: null, dateAria: null, commentCountText: '5', emptyState: false, items, ...extra }],
+  });
+
+  test('comment ids, replies (by indentation), threads and canonical permalinks', () => {
+    const { comments, warnings } = normalizeExtraction(dialogRaw(fiberItems()), { savedAt: SAVED_AT, fallbackGroupSlug: G });
+    assert.deepEqual(comments.map((c) => c.id), [C1, R1, R2, C2, R4]);
+    assert.deepEqual(comments.map((c) => c.isReply), [false, true, true, false, true]);
+    assert.deepEqual(comments.map((c) => c.depth), [0, 1, 2, 0, 1]);
+    assert.deepEqual(comments.map((c) => c.threadId), [C1, C1, C1, C2, C2]);
+    assert.deepEqual(comments.map((c) => c.parentId), [null, C1, R1, null, C2]);
+    assert.equal(comments[0].permalink, `${BASE}/posts/${POST_ID}/?comment_id=${C1}`);
+    assert.equal(comments[2].permalink, `${BASE}/posts/${POST_ID}/?comment_id=${C1}&reply_comment_id=${R2}`);
+    assert.ok(!warnings.some((w) => /synthetic/.test(w)));
+    assert.ok(!warnings.some((w) => /page data/.test(w)), 'the page URL confirms the post id');
+  });
+
+  test('authorId/authorName/authorUrl from React data when there is no author link', () => {
+    const { comments } = normalizeExtraction(dialogRaw(fiberItems()), { savedAt: SAVED_AT, fallbackGroupSlug: G });
+    assert.equal(comments[0].authorName, 'Thura Min Oo');
+    assert.equal(comments[0].authorId, '100004444444444');
+    assert.equal(comments[0].authorUrl, 'https://www.facebook.com/profile.php?id=100004444444444');
+    assert.equal(comments[3].authorName, 'Chai_lover🍵');
+    // A link (and its text) still wins over React data.
+    const items = fiberItems();
+    items[0].authorName = 'Thura (link)';
+    items[0].authorHref = userLink('100009999999999');
+    const r = normalizeExtraction(dialogRaw(items), { savedAt: SAVED_AT, fallbackGroupSlug: G });
+    assert.equal(r.comments[0].authorName, 'Thura (link)');
+    assert.equal(r.comments[0].authorId, '100009999999999');
+    // React data's name comes before the aria-label parse.
+    const noName = fiberItems();
+    noName[1].ariaLabel = "Reply by Someone Else to Thura Min Oo's comment 2 days ago";
+    assert.equal(normalizeExtraction(dialogRaw(noName), { savedAt: SAVED_AT }).comments[1].authorName, 'Snow2Rain2');
+  });
+
+  test('a permalink id wins over the React id; non-numeric React values are ignored', () => {
+    const items = fiberItems();
+    items[0].permalinkHref = commentLink(POST_ID, '1000000000000099');
+    items[1].fiberCommentId = 'not-a-number';
+    items[1].fiberAuthorId = 'pfbid0abc';
+    const { comments } = normalizeExtraction(dialogRaw(items), { savedAt: SAVED_AT, fallbackGroupSlug: G });
+    assert.equal(comments[0].id, '1000000000000099');
+    assert.match(comments[1].id, /^h:/, 'falls back to a synthetic id');
+    assert.equal(comments[1].authorId, null);
+  });
+
+  test('post id order: comment links → comment React ids → page URL → post link → post React id', () => {
+    const other = '7777777777777777';
+    const opts = { savedAt: SAVED_AT, fallbackGroupSlug: G };
+    // Comment React ids beat the page URL.
+    const r1 = normalizeExtraction(dialogRaw(fiberItems(other)), opts);
+    assert.equal(r1.posts[0].id, other);
+    assert.ok(r1.warnings.some((w) => w.startsWith(`Post ${other}: no link names this post`)));
+    // One vote per comment (its link's post id, else its React id): the majority decides.
+    const items = fiberItems(other);
+    items[0].permalinkHref = commentLink(POST_ID, C1);
+    items[1].permalinkHref = commentLink(POST_ID, C1, R1);
+    items[2].permalinkHref = commentLink(POST_ID, C1, R2);
+    assert.equal(normalizeExtraction(dialogRaw(items), opts).posts[0].id, POST_ID);
+    // Feed post: no comments, no link → the post's React id, slug from the page URL.
+    const feedRaw = {
+      pageUrl: `https://www.facebook.com/groups/${G}/?sorting_setting=CHRONOLOGICAL`,
+      pageTitle: 'x',
+      rootKind: 'feed',
+      extractedAt: EXTRACTED_AT,
+      posts: [
+        { permalinkHref: null, authorName: 'Op', authorHref: null, text: 'a', dateText: '5h', dateAria: null, commentCountText: null, emptyState: false, fiberPostId: other, items: [] },
+        { permalinkHref: `${BASE}/posts/${POST_ID}/?__cft__[0]=x`, authorName: 'Op', authorHref: null, text: 'b', dateText: '6h', dateAria: null, commentCountText: null, emptyState: false, fiberPostId: other, items: [] },
+        { permalinkHref: null, authorName: 'Op', authorHref: null, text: 'c', dateText: '7h', dateAria: null, commentCountText: null, emptyState: false, fiberPostId: 'abc', items: [] },
+      ],
+    };
+    const r2 = normalizeExtraction(feedRaw, { savedAt: SAVED_AT, fallbackGroupSlug: null });
+    assert.deepEqual(r2.posts.map((p) => p.id), [other, POST_ID]);
+    assert.equal(r2.posts[0].groupSlug, G);
+    assert.equal(r2.posts[0].url, `${BASE}/posts/${other}/`);
+    assert.ok(r2.warnings.some((w) => /^Skipped post #3/.test(w)), 'a non-numeric React id is not an id');
+    // Without any slug the post still gets saved (url null), never filed under a wrong group.
+    const r3 = normalizeExtraction({ ...feedRaw, pageUrl: 'https://www.facebook.com/', posts: [feedRaw.posts[0]] }, { savedAt: SAVED_AT });
+    assert.equal(r3.posts[0].groupSlug, null);
+    assert.equal(r3.posts[0].url, null);
+  });
+
+  test('one stray comment link never outvotes the other comments\' React ids', () => {
+    // A link to another post's comment (e.g. pasted in a comment) taken for item 1's permalink.
+    const stray = '1777000000000001';
+    const items = fiberItems();
+    items[1].permalinkHref = commentLink(stray, '4242000000000001');
+    const opts = { savedAt: SAVED_AT, fallbackGroupSlug: G };
+    const r = normalizeExtraction(dialogRaw(items), opts);
+    assert.equal(r.posts[0].id, POST_ID);
+    assert.equal(r.posts[0].url, `${BASE}/posts/${POST_ID}/`);
+    assert.ok(r.comments.every((c) => c.postId === POST_ID));
+    assert.ok(r.comments.every((c) => !(c.permalink || '').includes(`/posts/${stray}/`)), 'no permalink names the other post');
+    // Without a page URL (feed quick save) the React majority still wins over the single link.
+    const feed = { ...dialogRaw(items), pageUrl: `https://www.facebook.com/groups/${G}/`, rootKind: 'feed' };
+    const f = normalizeExtraction(feed, opts);
+    assert.equal(f.posts[0].id, POST_ID);
+    assert.ok(f.warnings.some((w) => w.startsWith(`Post ${POST_ID}: no link names this post`)));
+    // Links that are the majority still win, with their URL's parts.
+    const many = fiberItems(stray);
+    many[0].permalinkHref = commentLink(POST_ID, C1);
+    many[1].permalinkHref = commentLink(POST_ID, C1, R1);
+    many[2].permalinkHref = commentLink(POST_ID, C1, R2);
+    const m = normalizeExtraction({ ...dialogRaw(many), pageUrl: 'https://www.facebook.com/' }, opts);
+    assert.equal(m.posts[0].id, POST_ID);
+    assert.ok(!m.warnings.some((w) => /page data/.test(w)), 'confirmed by comment links');
+  });
+});

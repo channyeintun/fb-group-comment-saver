@@ -557,3 +557,18 @@ body {
   justify-content: flex-end;
   padding: 10px 12px;
 }
+
+/* Diagnostics: fallback when the clipboard is not available */
+.diag-fallback {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.diag-fallback textarea {
+  width: 100%;
+  min-height: 140px;
+  resize: vertical;
+  font: 11px/1.4 var(--mono);
+}

@@ -45,6 +45,12 @@ const swErrors = [];
 // ------------------------------------------------------------------------------------------------
 // Harness
 
+/**
+ * Markup variant for every fixture page served (see the variant notes in tests/fixtures/*.html):
+ * injected as window.FBCS_FIXTURE_VARIANT, so the canonical post URLs a crawl opens keep it.
+ */
+let fixtureVariant = '';
+
 function serveFixture(route) {
   const url = new URL(route.request().url());
   let file = null;
@@ -52,11 +58,11 @@ function serveFixture(route) {
   else if (/^\/groups\/[^/]+\/(posts|permalink)\/[\w.-]+\/?$/.test(url.pathname)) file = 'post-dialog.html';
   else if (/^\/groups\/[^/]+\/?$/.test(url.pathname)) file = 'feed.html';
   if (!file) return route.fulfill({ status: 404, contentType: 'text/plain', body: 'not found' });
-  return route.fulfill({
-    status: 200,
-    contentType: 'text/html; charset=utf-8',
-    body: fs.readFileSync(path.join(FIXTURES, file)),
-  });
+  let body = fs.readFileSync(path.join(FIXTURES, file), 'utf8');
+  if (fixtureVariant) {
+    body = body.replace('<head>', `<head><script>window.FBCS_FIXTURE_VARIANT = ${JSON.stringify(fixtureVariant)};</script>`);
+  }
+  return route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body });
 }
 
 /** Collect console errors / uncaught exceptions of an extension page. */
@@ -714,6 +720,145 @@ test('i. library: long reply chains nest at most two levels; a deep link leaves 
     assert.deepEqual(libErrors, []);
   } finally {
     await lib.close();
+  }
+});
+
+/** Author names and text snippets the fixtures show (must never appear in diagnostics). */
+const FIXTURE_NAMES = [
+  'Kyaw Zin Thant', 'Thura Min Oo', 'Aye Chan Moe', 'Chai_lover', 'Min Thu', 'Su Su Hlaing', 'Ei Mon Kyaw',
+  'Zaw Min Oo', 'LuckyPanda7781', 'Feed Preview Person', 'Aung Ko Ko', 'testgroup',
+];
+
+test('j. markup without hrefs (?variant=nohref): the crawl finds posts and comment ids from React data', TEST_TIMEOUT, async () => {
+  fixtureVariant = 'nohref';
+  try {
+    const st = await runJob('crawl', {
+      url: `${GROUP_URL}/?variant=nohref`,
+      overrides: { maxPosts: 3, groupUrl: GROUP_URL, feedSort: 'DEFAULT', skipSavedWithinHours: 0 },
+    });
+    assert.equal(st.status, 'done', `job should finish (error: ${st.error})`);
+    assert.equal(st.postsTotal, 3);
+    assert.equal(st.postsFailed, 0);
+    assert.equal(st.commentsSeen, 3 * 17);
+    assert.ok(st.log.some((l) => /^Feed scan: \d+ posts seen — ids from links 0, page data [1-9]/.test(l.msg)), 'ids from page data');
+    // The same posts were saved earlier with permalinks: React ids match them exactly.
+    assert.equal(st.inserted, 0, 'no new (synthetic) comments');
+    assert.equal(st.markedMissing, 0, 'nothing marked missing');
+    for (const id of ['1001', '1002', '1003']) {
+      const comments = await commentsOf(id);
+      assert.ok(comments.length >= 17, `post ${id} comments`);
+      assert.ok(comments.every((c) => !c.id.startsWith('h:')), `post ${id} has only real comment ids`);
+    }
+    assert.deepEqual((await commentsOf('1001')).map((c) => c.id), FULL_ORDER_1001);
+  } finally {
+    fixtureVariant = '';
+  }
+});
+
+test('k. quick save reads React data in the MAIN world (?variant=nohref post)', TEST_TIMEOUT, async () => {
+  fixtureVariant = 'nohref';
+  try {
+    const st = await runJob('quick', { url: postUrl(1005, '?variant=nohref') });
+    assert.equal(st.status, 'done', `job should finish (error: ${st.error})`);
+    assert.equal(st.inserted, 5);
+    const comments = await commentsOf('1005');
+    assert.deepEqual(
+      comments.map((c) => c.id),
+      ['100502001', '100502002', '100502003', '100502004', '100502005'],
+      'comment ids from React data (an isolated world would only get synthetic ids)',
+    );
+    assert.equal(comments[0].authorId, '100101');
+    assert.equal(comments[0].permalink, `${GROUP_URL}/posts/1005/?comment_id=100502001`);
+    assert.ok(!st.log.some((l) => /synthetic/.test(l.msg)));
+  } finally {
+    fixtureVariant = '';
+  }
+});
+
+test('l. side panel "Copy diagnostics": a privacy-safe report of the page and the last job', TEST_TIMEOUT, async () => {
+  fixtureVariant = 'nohref';
+  try {
+    await fb.goto(postUrl(1005, '?variant=nohref'), { waitUntil: 'load' });
+    await fb.bringToFront();
+    await ui.locator('#tab-chip-label').filter({ hasText: /^Post$/ }).waitFor({ timeout: 10_000 });
+    // The last job (quick save, 5 comments) saved something: no diagnostics offer in its card.
+    assert.equal(await ui.locator('#btn-diag-job').isHidden(), true);
+
+    // Clipboard available: the report is copied and a toast confirms it.
+    await ui.evaluate(() => {
+      window.__copied = null;
+      Object.defineProperty(navigator, 'clipboard', {
+        configurable: true,
+        value: { writeText: async (t) => void (window.__copied = t) },
+      });
+    });
+    const settings = ui.locator('#settings');
+    if (!(await settings.evaluate((d) => d.open))) await ui.locator('#settings > summary').click();
+    await ui.locator('#btn-diag').click();
+    await ui.locator('.toast', { hasText: 'Diagnostics copied — paste it in your message' }).waitFor({ timeout: 10_000 });
+    const text = await ui.evaluate(() => window.__copied);
+    const report = JSON.parse(text);
+    assert.match(report.extension, /^\d+\.\d+\.\d+$/);
+    assert.equal(report.page.rootKind, 'dialog');
+    assert.equal(report.page.dialog.post.comments.count, 5);
+    assert.equal(report.page.dialog.post.comments.withFiberId, 5, 'MAIN world: React data is visible');
+    assert.equal(report.lastJob.mode, 'quick');
+    assert.ok(report.lastJob.log.length > 0 && report.lastJob.log.length <= 40);
+    for (const name of FIXTURE_NAMES) assert.ok(!text.includes(name), `report contains "${name}"`);
+    assert.doesNotMatch(text, /\d{5,}/, 'no ids in the report');
+    assert.doesNotMatch(text, /https?:\/\//, 'no URLs in the report');
+
+    // Clipboard refused: the report is shown in a read-only text box with "Select all".
+    await ui.evaluate(() => {
+      Object.defineProperty(navigator, 'clipboard', {
+        configurable: true,
+        value: { writeText: async () => { throw new Error('denied'); } },
+      });
+    });
+    await ui.locator('#btn-diag').click();
+    const area = ui.locator('.diag-fallback textarea');
+    await area.waitFor({ timeout: 10_000 });
+    assert.equal(await area.getAttribute('readonly'), '');
+    const fallback = JSON.parse(await area.inputValue());
+    assert.equal(fallback.page.rootKind, 'dialog');
+    await ui.locator('.diag-fallback button', { hasText: 'Select all' }).click();
+    await ui.locator('.diag-fallback button', { hasText: 'Close' }).click();
+    assert.equal(await ui.locator('.diag-fallback').count(), 0);
+  } finally {
+    fixtureVariant = '';
+  }
+});
+
+test('m. posts with an aria-label and lazy "#" links (?variant=arialabel,nohref,hash): the crawl saves them fully', TEST_TIMEOUT, async () => {
+  // Friend-like markup: post articles carry an aria-label like comments, and every link Facebook has
+  // not filled in is href="#" (a.href resolves it to the page URL). Posts must still be found in the
+  // feed and as the dialog root, and comment ids must come from React data, not from "#".
+  fixtureVariant = 'arialabel,nohref,hash';
+  try {
+    const startedAt = new Date().toISOString();
+    const st = await runJob('crawl', {
+      url: `${GROUP_URL}/?variant=${fixtureVariant}`,
+      overrides: { maxPosts: 2, groupUrl: GROUP_URL, feedSort: 'DEFAULT', skipSavedWithinHours: 0 },
+    });
+    assert.equal(st.status, 'done', `job should finish (error: ${st.error})`);
+    assert.equal(st.postsTotal, 2);
+    assert.equal(st.postsFailed, 0, st.log.map((l) => l.msg).join('\n'));
+    assert.equal(st.commentsSeen, 2 * 17);
+    assert.equal(st.inserted, 0, 'the same comment ids as the earlier saves (no synthetic or "#" ids)');
+    assert.equal(st.markedMissing, 0);
+    const saved = st.log.filter((l) => /^Saved post \d+:/.test(l.msg));
+    assert.equal(saved.length, 2);
+    assert.ok(saved.every((l) => !/incomplete scan/.test(l.msg)), saved.map((l) => l.msg).join('\n'));
+    assert.deepEqual((await commentsOf('1001')).map((c) => c.id), FULL_ORDER_1001);
+    assert.deepEqual((await commentsOf('1002')).map((c) => c.id), FULL_ORDER_1001.map((id) => `10020${id}`));
+    const { posts } = await readDb();
+    for (const id of ['1001', '1002']) {
+      const post = posts.find((p) => p.id === id);
+      assert.ok(post.lastFullScanAt >= startedAt, `post ${id} fully scanned by this crawl`);
+      assert.equal(post.authorName, 'Kyaw Zin Thant', 'the stored author is kept (the lazy header gives none)');
+    }
+  } finally {
+    fixtureVariant = '';
   }
 });
 

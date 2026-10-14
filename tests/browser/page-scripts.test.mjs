@@ -14,6 +14,7 @@ import { chromium } from 'playwright';
 import { extractRaw } from '../../src/page/extract.js';
 import { collectFeedPosts } from '../../src/page/feed.js';
 import { probePage } from '../../src/page/probe.js';
+import { diagnosePage } from '../../src/page/diagnose.js';
 import { DEFAULT_SETTINGS } from '../../src/lib/constants.js';
 import { normalizeExtraction } from '../../src/lib/normalize.js';
 
@@ -178,7 +179,7 @@ async function preparePostLikeDriver(page, { maxRounds = 12 } = {}) {
 // ---- serializability -------------------------------------------------------------------------
 
 test('page functions are self-contained and survive fn.toString() serialization', async () => {
-  for (const fn of [extractRaw, collectFeedPosts, probePage]) {
+  for (const fn of [extractRaw, collectFeedPosts, probePage, diagnosePage]) {
     const src = fn.toString();
     assert.match(src, /^function \w+\(opts\) \{/, `${fn.name} must be a plain one-parameter function`);
     const revived = new Function(`return (${src})`)();
@@ -432,6 +433,260 @@ test('driving the dialog like the driver reveals every comment and reply', async
   }
 });
 
+/** Evaluates a page function in a fresh isolated JS world (like chrome.scripting's default world). */
+async function evaluateIsolated(page, fn, arg) {
+  const cdp = await page.context().newCDPSession(page);
+  try {
+    const { frameTree } = await cdp.send('Page.getFrameTree');
+    const { executionContextId } = await cdp.send('Page.createIsolatedWorld', { frameId: frameTree.frame.id, worldName: 'isolated-test' });
+    const { result, exceptionDetails } = await cdp.send('Runtime.evaluate', {
+      contextId: executionContextId,
+      expression: `(${fn.toString()})(${JSON.stringify(arg)})`,
+      returnByValue: true,
+    });
+    if (exceptionDetails) throw new Error(exceptionDetails.text);
+    return result.value;
+  } finally {
+    await cdp.detach();
+  }
+}
+
+/** Fixture uid of each comment author in post-dialog.html. */
+const UID_BY_ID = {
+  2001: '100101', 3001: '100102', 3002: '100103', 3003: '100101', 2002: '100104', 2011: '100113', 2003: '100105',
+  2004: '100106', 3004: '100001', 3005: '100104', 2005: '100107', 2012: '100114', 2006: '100108', 2007: '100109',
+  2008: '100110', 2009: '100111', 2010: '100112',
+};
+
+test('post dialog ?variant=nohref: comment ids, post id and authors come from React data', async () => {
+  const plain = await openPage(postUrl(1001));
+  const page = await openPage(postUrl(1001, '?variant=nohref'));
+  try {
+    assert.equal((await preparePostLikeDriver(plain)).complete, true);
+    const run = await preparePostLikeDriver(page);
+    assert.equal(run.complete, true, `expansion did not settle: ${JSON.stringify(run)}`);
+
+    const raw = await page.evaluate(extractRaw, { scope: 'auto' });
+    assert.equal(raw.rootKind, 'dialog');
+    const items = raw.posts[0].items;
+    assert.equal(items.length, 17);
+    assert.ok(items.every((c) => c.permalinkHref === null), 'no permalink anywhere');
+    assert.deepEqual(items.map((c) => c.fiberCommentId), FULL_ORDER);
+    assert.ok(items.every((c) => c.fiberPostId === '1001'));
+    assert.deepEqual(items.map((c) => c.fiberAuthorId), FULL_ORDER.map((id) => UID_BY_ID[id]));
+    assert.equal(items[4].fiberAuthorName, 'Chai_lover🍵');
+    assert.equal(items[0].fiberAuthorName, 'Thura Min Oo');
+    // The date still comes from the timestamp link's aria-label.
+    assert.ok(items.every((c) => /October 2026 at/.test(c.timeAria || '')), 'timeAria from the href-less time link');
+    assert.ok(items.every((c) => /^\d+[hdw]$/.test(c.timeText || '')));
+
+    // Without the MAIN world the fiber fields are null (never throws).
+    const isolated = await evaluateIsolated(page, extractRaw, { scope: 'auto' });
+    assert.equal(isolated.posts[0].items.length, 17);
+    assert.ok(isolated.posts[0].items.every((c) => c.fiberCommentId === null && c.fiberAuthorName === null));
+    assert.equal(isolated.posts[0].fiberPostId, null);
+
+    // Normalized: the same ids, threads, parents and depths as with permalinks.
+    const opts = { savedAt: '2026-10-14T00:00:00.000Z', fallbackGroupSlug: 'testgroup', mode: 'post' };
+    const viaFiber = normalizeExtraction(raw, opts);
+    const viaLinks = normalizeExtraction(await plain.evaluate(extractRaw, { scope: 'auto' }), opts);
+    const pick = (c) => ({ id: c.id, threadId: c.threadId, parentId: c.parentId, depth: c.depth, isReply: c.isReply, authorId: c.authorId, createdAt: c.createdAt, permalink: c.permalink });
+    assert.deepEqual(viaFiber.comments.map(pick), viaLinks.comments.map(pick));
+    assert.equal(viaFiber.posts[0].id, '1001');
+    assert.ok(!viaFiber.warnings.some((w) => /synthetic/.test(w)), viaFiber.warnings.join(' | '));
+  } finally {
+    await plain.close();
+    await page.close();
+  }
+});
+
+const PICK = (c) => ({ id: c.id, threadId: c.threadId, parentId: c.parentId, depth: c.depth, isReply: c.isReply, authorId: c.authorId, permalink: c.permalink });
+const NORM_OPTS = { savedAt: '2026-10-14T00:00:00.000Z', fallbackGroupSlug: 'testgroup', mode: 'post' };
+
+test('lazy "#" hrefs (?variant=hash) are never permalinks, even on a ?comment_id= notification URL', async () => {
+  const ref = await openPage(postUrl(1001, '?variant=nohref'));
+  const page = await openPage(postUrl(1001, '?variant=nohref,hash&comment_id=2003'));
+  const linked = await openPage(postUrl(1001, '?variant=hash&comment_id=2003'));
+  try {
+    // a.href of "#" is the page URL + "#": here it carries comment_id=2003 and names post 1001.
+    assert.equal(await page.locator('[role="dialog"] [role="article"][aria-label] a.time[href="#"]').count(), 5);
+    assert.equal(await page.locator('#post .post-header a[href="#"]').count(), 4);
+    const raw = await page.evaluate(extractRaw, { scope: 'auto' });
+    const post = raw.posts[0];
+    assert.equal(post.permalinkHref, null, 'a lazy header link is not the post permalink');
+    assert.equal(post.dateAria, null, 'the avatar link\'s aria-label (a name) is never the date');
+    assert.equal(post.dateText, '4 October at 18:19');
+    assert.equal(post.authorName, null, 'a lazy link is not a profile link');
+    assert.ok(post.items.every((c) => c.permalinkHref === null), 'no comment permalink from "#"');
+    assert.deepEqual(post.items.map((c) => c.fiberCommentId), ['2001', '2002', '2003', '2004', '2005']);
+    assert.ok(post.items.every((c) => /October 2026 at/.test(c.timeAria || '')), 'the date still comes from the time link');
+
+    // Same records as the href-less markup: React ids, not 2003, 2003~2, ….
+    const viaHash = normalizeExtraction(raw, NORM_OPTS);
+    const viaNone = normalizeExtraction(await ref.evaluate(extractRaw, { scope: 'auto' }), NORM_OPTS);
+    assert.deepEqual(viaHash.comments.map((c) => c.id), ['2001', '2002', '2003', '2004', '2005']);
+    assert.deepEqual(viaHash.comments.map(PICK), viaNone.comments.map(PICK));
+    assert.equal(viaHash.posts[0].postedAtText, '4 October at 18:19');
+
+    // Without React data (isolated world) nothing names the comments: synthetic ids, never 2003.
+    const isolated = await evaluateIsolated(page, extractRaw, { scope: 'auto' });
+    assert.ok(isolated.posts[0].items.every((c) => c.permalinkHref === null && c.fiberCommentId === null));
+    const synth = normalizeExtraction(isolated, NORM_OPTS);
+    assert.equal(synth.posts[0].id, '1001', 'from the page URL');
+    assert.ok(synth.comments.every((c) => c.id.startsWith('h:')), synth.comments.map((c) => c.id).join(' '));
+
+    // Real comment links next to a lazy post header: the comments keep their own ids.
+    const rawLinked = await linked.evaluate(extractRaw, { scope: 'auto' });
+    assert.deepEqual(rawLinked.posts[0].items.map(commentId), ['2001', '2002', '2003', '2004', '2005']);
+    assert.equal(rawLinked.posts[0].dateAria, null);
+    assert.equal(rawLinked.posts[0].dateText, '4 October at 18:19');
+  } finally {
+    await Promise.all([ref.close(), page.close(), linked.close()]);
+  }
+});
+
+test('a link to another comment in a comment\'s body or link card is never its permalink (?commentLinks)', async () => {
+  const page = await openPage(postUrl(1001, '?variant=nohref&commentLinks=1777_4242'));
+  const linked = await openPage(postUrl(1001, '?commentLinks=1777_4242'));
+  try {
+    assert.equal(await page.locator('[role="dialog"] a[href*="/posts/1777/?comment_id=4242"]').count(), 2);
+    const raw = await page.evaluate(extractRaw, { scope: 'auto' });
+    const items = raw.posts[0].items;
+    assert.equal(items[1].fiberCommentId, '2002');
+    // The pasted link is in the body; the card after the body names another comment than React data.
+    assert.equal(items[1].permalinkHref, null);
+    assert.match(items[1].text, /Same question here: https:\/\/www\.facebook\.com\/groups\/testgroup\/posts\/1777\//);
+    const norm = normalizeExtraction(raw, NORM_OPTS);
+    assert.deepEqual(norm.posts.map((p) => p.id), ['1001']);
+    assert.deepEqual(norm.comments.map((c) => c.id), ['2001', '2002', '2003', '2004', '2005']);
+    assert.ok(norm.comments.every((c) => c.postId === '1001' && !/1777|4242/.test(c.permalink || '')));
+    assert.ok(!norm.warnings.some((w) => /1777/.test(w)), norm.warnings.join(' | '));
+
+    // With permalinks: C2's own timestamp link wins over both other links.
+    const rawLinked = await linked.evaluate(extractRaw, { scope: 'auto' });
+    assert.deepEqual(rawLinked.posts[0].items.map(commentId), ['2001', '2002', '2003', '2004', '2005']);
+    assert.ok(rawLinked.posts[0].items.every((c) => c.permalinkHref.includes('/posts/1001/')));
+  } finally {
+    await Promise.all([page.close(), linked.close()]);
+  }
+});
+
+test('posts with an aria-label (?variant=arialabel) are still posts: feed items, dialog root, probe', async () => {
+  const feed = await openPage(`${FEED_URL}?variant=arialabel`);
+  const dialog = await openPage(postUrl(1001, '?variant=arialabel'));
+  try {
+    assert.equal(await feed.locator('[role="feed"] [role="article"]:not([aria-label])').count(), 0);
+    const raw = await feed.evaluate(extractRaw, { scope: 'auto' });
+    assert.equal(raw.rootKind, 'feed');
+    assert.deepEqual(raw.posts.map((p) => p.permalinkHref.match(/\/posts\/(\d+)\//)[1]), ['1001', '1002', '1003', '1004', '1005']);
+    assert.deepEqual(raw.posts.map((p) => p.items.length), [1, 0, 1, 0, 1], 'preview comments belong to their posts');
+    assert.equal(raw.posts[0].authorName, 'Kyaw Zin Thant');
+    assert.equal(normalizeExtraction(raw, NORM_OPTS).comments.length, 3);
+    const scan = await feed.evaluate(collectFeedPosts, {});
+    assert.deepEqual(scan.posts.map((p) => p.postId), ['1001', '1002', '1003', '1004', '1005']);
+    const feedProbe = await feed.evaluate(probePage, PROBE_OPTS);
+    assert.equal(feedProbe.commentCount, 3, 'posts are not counted as comments');
+
+    // The post dialog is found (not the feed behind it) and its comments are the post's.
+    assert.equal(await dialog.locator('#post[aria-label]').count(), 1);
+    const d = await dialog.evaluate(extractRaw, { scope: 'auto' });
+    assert.equal(d.rootKind, 'dialog');
+    assert.equal(d.posts.length, 1);
+    assert.deepEqual(d.posts[0].items.map(commentId), ['2001', '2002', '2003', '2004', '2005']);
+    assert.equal(d.posts[0].authorName, 'Kyaw Zin Thant');
+    assert.equal(d.posts[0].commentCountText, '12');
+    assert.equal(d.posts[0].dateText, '4 October at 18:19');
+    assert.match(d.posts[0].text, /^Do you need a CS degree/);
+    const probe = await dialog.evaluate(probePage, PROBE_OPTS);
+    assert.equal(probe.rootKind, 'dialog');
+    assert.equal(probe.postArticleFound, true);
+    assert.equal(probe.commentCount, 5);
+    assert.equal(probe.expanderCount, 3);
+    assert.equal(probe.sortLabel, 'Most relevant');
+    assert.equal(probe.commentCountText, '12');
+    const diag = await dialog.evaluate(diagnosePage, PROBE_OPTS);
+    assertPrivate(diag, 'arialabel dialog');
+    assert.equal(diag.rootKind, 'dialog');
+    assert.equal(diag.dialog.post.container.ariaLabel, true);
+    assert.equal(diag.dialog.post.comments.count, 5);
+  } finally {
+    await Promise.all([feed.close(), dialog.close()]);
+  }
+});
+
+/** Every author name, and text snippets, that a fixture shows. */
+const FIXTURE_NAMES = [
+  'Kyaw Zin Thant', 'Thura Min Oo', 'Aye Chan Moe', 'Chai_lover', 'BrightOtter3141', 'Min Thu', 'Su Su Hlaing',
+  'Ei Mon Kyaw', 'Zaw Min Oo', 'Thiri Aung', 'Nay Lin', 'Hnin Wai', 'LuckyPanda7781', 'Crypto Deals', 'Phyo Wai',
+  'Khin Myat', 'Feed Preview Person', 'Aung Ko Ko', 'Test Group', 'testgroup',
+];
+const FIXTURE_TEXTS = [
+  'backend framework', 'CS degree', 'Hardly any degree', 'Self-study', 'roadmap', 'matcha', 'Portfolio', 'Bootcamps',
+  'Great question', 'ကျွန်တော်', 'မင်္ဂလာပါ', 'PostgreSQL', 'Kubernetes', 'Earn $500',
+];
+
+function assertPrivate(report, label) {
+  const json = JSON.stringify(report);
+  for (const name of FIXTURE_NAMES) assert.ok(!json.includes(name), `${label}: report contains the name "${name}"`);
+  for (const text of FIXTURE_TEXTS) assert.ok(!json.includes(text), `${label}: report contains the text "${text}"`);
+  assert.doesNotMatch(json, /\d{5,}/, `${label}: report contains a 5+ digit number`);
+  assert.doesNotMatch(json, /https?:\/\//, `${label}: report contains a full URL`);
+}
+
+test('diagnosePage: structural report without names, text, ids or URLs', async () => {
+  const dialog = await openPage(postUrl(1001, '?variant=nohref'));
+  const feed = await openPage(FEED_URL);
+  const feedNohref = await openPage(`${FEED_URL}?variant=nohref`);
+  const roleless = await openPage(`${FEED_URL}?variant=roleless`);
+  try {
+    const d = await dialog.evaluate(diagnosePage, PROBE_OPTS);
+    assertPrivate(d, 'dialog');
+    assert.equal(d.rootKind, 'dialog');
+    assert.equal(d.lang, 'en');
+    assert.deepEqual(d.url, { host: 'www', path: '/groups/{g}/posts/1001/', query: ['variant'] });
+    assert.equal(d.counts.dialogsWithArticles, 1);
+    assert.equal(d.dialog.post.comments.count, 5);
+    assert.equal(d.dialog.post.comments.withPermalink, 0);
+    assert.equal(d.dialog.post.comments.withFiberId, 5);
+    assert.equal(d.dialog.post.comments.withFiberAuthor, 5);
+    assert.equal(d.dialog.post.story, true);
+    assert.equal(d.dialog.controls.expanderMatches, 3);
+    assert.equal(d.dialog.controls.sortButtonMatches, 1);
+    assert.ok(Object.keys(d.dialog.controls.unlabelledTextShapes).length > 0);
+    assert.ok(Object.keys(d.dialog.controls.unlabelledTextShapes).every((k) => /^len\d+(:[a-z+]+)?$/.test(k)));
+    assert.ok(d.viewport.w > 0 && d.viewport.h > 0);
+
+    const isolated = await evaluateIsolated(dialog, diagnosePage, PROBE_OPTS);
+    assert.equal(isolated.dialog.post.comments.withFiberId, 0, 'fibers are invisible outside the MAIN world');
+    assert.equal(isolated.counts.fiberNodes, 0);
+
+    const f = await feed.evaluate(diagnosePage, undefined);
+    assertPrivate(f, 'feed');
+    assert.equal(f.rootKind, 'feed');
+    assert.equal(f.counts.feeds, 1);
+    assert.equal(f.feedPosts.length, 5);
+    const p1 = f.feedPosts[0];
+    assert.deepEqual(p1.container, { tag: 'div', role: 'article', ariaLabel: false, labelledby: true, posinset: false, describedby: false });
+    assert.equal(p1.story, true);
+    assert.equal(p1.fiberReachable, false);
+    assert.ok(p1.headerLinks.some((l) => l.href === '/groups/{g}/posts/1001/' && l.text === 'len2:digit+alpha'));
+    assert.equal(p1.comments.count, 1);
+    assert.equal(p1.comments.withPermalink, 1);
+
+    const fn = await feedNohref.evaluate(diagnosePage, undefined);
+    assertPrivate(fn, 'feed nohref');
+    assert.ok(fn.feedPosts.every((p) => p.fiberReachable && p.fiberPostIdFound));
+    assert.ok(fn.feedPosts.every((p) => p.headerLinks.some((l) => l.href === '#')));
+
+    const r = await roleless.evaluate(diagnosePage, undefined);
+    assertPrivate(r, 'feed roleless');
+    assert.equal(r.feeds[0].containerMode, 'children');
+    assert.equal(r.feedPosts[0].container.role, null);
+  } finally {
+    await Promise.all([dialog.close(), feed.close(), feedNohref.close(), roleless.close()]);
+  }
+});
+
 test('post id comes from the URL and ?variant=minus1 omits C5', async () => {
   const page = await openPage(postUrl(1002, '?variant=minus1'));
   try {
@@ -521,68 +776,94 @@ test('extractRaw + probePage on the group feed', async () => {
   }
 });
 
-test('collectFeedPosts collects all 30 posts despite virtualization and recovers the lazy href by hovering', async () => {
+/**
+ * Scroll the feed like the driver (wheel + re-scan); for posts reported missing, hover the marked
+ * link and read its href at once (Facebook can clear it on mouseout), as collectFeedLinks does.
+ */
+async function scanFeedLikeDriver(page) {
+  const seen = new Map();
+  const hovered = [];
+  const viaHover = new Set();
+  const sources = { link: 0, react: 0, linkAny: 0, comments: 0 };
+  let markHoverFrom = 0;
+  let stale = 0;
+  let lastScan = null;
+  // Keep the pointer beside the feed column so wheel scrolling never hovers post links by accident.
+  const parkMouse = () => page.mouse.move(1260, 360);
+  const add = (scan) => {
+    for (const p of scan.posts) {
+      if (seen.has(p.postId)) continue;
+      seen.set(p.postId, p);
+      sources[p.idSource === 'link-any' ? 'linkAny' : p.idSource]++;
+    }
+  };
+  await parkMouse();
+  for (let round = 0; round < 60 && seen.size < 30 && stale < 6; round++) {
+    const before = seen.size;
+    let scan = await page.evaluate(collectFeedPosts, { markHoverFrom });
+    lastScan = scan;
+    assert.equal(scan.feedFound, true);
+    add(scan);
+    if (scan.missing.length) {
+      markHoverFrom += scan.missing.length;
+      for (const { hoverId } of scan.missing) {
+        const target = page.locator(`[data-fbcs-hover="${hoverId}"]`);
+        const info = await target.evaluate((el) => ({
+          href: el.getAttribute('href'),
+          text: el.textContent,
+          labelledby: (el.closest('.card') || el).getAttribute('aria-labelledby'),
+        }));
+        hovered.push(info);
+        await target.hover();
+        const href = await target.getAttribute('href');
+        const m = /\/posts\/(\d+)\//.exec(href || '');
+        if (m && !seen.has(m[1])) {
+          seen.set(m[1], { postId: m[1], permalinkHref: new URL(href, page.url()).href, idSource: 'hover' });
+          viaHover.add(m[1]);
+        }
+      }
+      scan = await page.evaluate(collectFeedPosts, { markHoverFrom });
+      markHoverFrom += scan.missing.length;
+      add(scan);
+      await parkMouse();
+    }
+    await page.mouse.wheel(0, 1600);
+    await page.waitForTimeout(350);
+    stale = seen.size > before ? 0 : stale + 1;
+  }
+  return { seen, hovered, viaHover, sources, lastScan, markHoverFrom };
+}
+
+const ALL_30 = Array.from({ length: 30 }, (_, i) => String(1001 + i));
+
+test('collectFeedPosts collects all 30 posts despite virtualization; the lazy post gets its id from its comments', async () => {
   const page = await openPage(FEED_URL);
   try {
-    const seen = new Map();
-    const hovered = [];
-    let markHoverFrom = 0;
-    let lazyMissingBeforeHover = false;
-    let stale = 0;
-    // Keep the pointer beside the feed column so wheel scrolling never hovers post links by accident.
-    const parkMouse = () => page.mouse.move(1260, 360);
-    const add = (scan) => {
-      for (const p of scan.posts) if (!seen.has(p.postId)) seen.set(p.postId, p);
-    };
-
-    await parkMouse();
-    for (let round = 0; round < 60 && seen.size < 30 && stale < 6; round++) {
-      const before = seen.size;
-      let scan = await page.evaluate(collectFeedPosts, { markHoverFrom });
-      assert.equal(scan.feedFound, true);
-      add(scan);
-      if (scan.missing.length) {
-        markHoverFrom += scan.missing.length;
-        for (const { hoverId } of scan.missing) {
-          const target = page.locator(`[data-fbcs-hover="${hoverId}"]`);
-          const info = await target.evaluate((el) => ({
-            href: el.getAttribute('href'),
-            text: el.textContent,
-            article: el.closest('[role="article"]').getAttribute('aria-labelledby'),
-          }));
-          if (info.article.includes('_r_1013a_')) lazyMissingBeforeHover = info.href === '#';
-          hovered.push(info);
-          await target.hover();
-        }
-        scan = await page.evaluate(collectFeedPosts, { markHoverFrom });
-        markHoverFrom += scan.missing.length;
-        add(scan);
-        await parkMouse();
-      }
-      await page.mouse.wheel(0, 1600);
-      await page.waitForTimeout(350);
-      stale = seen.size > before ? 0 : stale + 1;
-    }
-
+    const { seen, hovered, sources, markHoverFrom } = await scanFeedLikeDriver(page);
     const ids = [...seen.keys()].sort();
     assert.ok(!seen.has('5555'), 'a group-post link pasted in a post body is never a permalink');
     assert.equal(seen.size, 30);
-    assert.deepEqual(ids, Array.from({ length: 30 }, (_, i) => String(1001 + i)));
+    assert.deepEqual(ids, ALL_30);
     for (const [id, p] of seen) {
-      assert.equal(p.permalinkHref.startsWith(`https://www.facebook.com/groups/testgroup/posts/${id}/`), true);
+      if (id !== '1013') {
+        assert.equal(p.idSource, 'link');
+        assert.equal(p.permalinkHref.startsWith(`https://www.facebook.com/groups/testgroup/posts/${id}/`), true);
+      }
       assert.ok(p.authorName, `author of ${id}`);
       assert.match(p.dateText, /^\d+[hd]$/);
       assert.ok(p.textPreview.length > 0 && p.textPreview.length <= 160);
       const i = Number(id) - 1001;
       assert.equal(p.commentCountText, i % 4 === 3 ? null : String(((i * 7) % 23) + 1), `comment count of ${id}`);
     }
+    assert.deepEqual(sources, { link: 29, react: 0, linkAny: 0, comments: 1 });
 
-    // The lazy post was reported as missing, hovered via its data-fbcs-hover mark, then recovered.
-    assert.equal(lazyMissingBeforeHover, true, 'post 1013 was first reported in `missing`');
-    assert.equal(hovered.length, 1, 'only post 1013 lacks a permalink');
-    assert.equal(hovered[0].text, '2d');
-    assert.equal(seen.get('1013').permalinkHref, 'https://www.facebook.com/groups/testgroup/posts/1013/?__cft__[0]=AZX&__tn__=%2CO%2CP-R');
-    assert.equal(seen.get('1013').dateText, '2d');
+    // Post 1013's header link is still lazy ("#"): its preview comment's /posts/1013/?comment_id=…
+    // names the post, but is never reported as its permalink. No hovering needed.
+    const p1013 = seen.get('1013');
+    assert.equal(p1013.idSource, 'comments');
+    assert.equal(p1013.permalinkHref, null);
+    assert.equal(p1013.dateText, '2d');
+    assert.equal(hovered.length, 0, 'nothing left to hover');
 
     // Virtualization really happened: posts far above are emptied, so one scan alone is not enough.
     const finalScan = await page.evaluate(collectFeedPosts, { markHoverFrom });
@@ -590,10 +871,129 @@ test('collectFeedPosts collects all 30 posts despite virtualization and recovers
     assert.equal(wrappers, 30);
     assert.ok(finalScan.renderedCount < 30, `renderedCount ${finalScan.renderedCount}`);
     assert.ok(!finalScan.posts.some((p) => p.postId === '1001'), 'post 1001 is virtualized at the bottom');
+    assert.equal(finalScan.groupSlug, 'testgroup');
+    assert.equal(finalScan.diag.feeds, 1);
+    assert.equal(finalScan.diag.containerMode, 'article');
     const emptied = await page.evaluate(
       () => [...document.querySelectorAll('[role="feed"] > div > [role="article"]')].filter((a) => !a.textContent.trim() && !a.querySelector('a')).length,
     );
     assert.ok(emptied > 0, 'some posts were emptied by virtualization');
+  } finally {
+    await page.close();
+  }
+});
+
+test('feed ?variant=nohref: every id comes from React page data (header links stay "#")', async () => {
+  const page = await openPage(`${FEED_URL}?variant=nohref`);
+  try {
+    // extractRaw: the feed posts' ids from React data; normalize uses them (with a warning).
+    const raw = await page.evaluate(extractRaw, { scope: 'auto' });
+    assert.equal(raw.rootKind, 'feed');
+    assert.deepEqual(raw.posts.map((p) => p.permalinkHref), [null, null, null, null, null]);
+    assert.deepEqual(raw.posts.map((p) => p.fiberPostId), ['1001', '1002', '1003', '1004', '1005']);
+    const norm = normalizeExtraction(raw, { savedAt: '2026-10-14T00:00:00.000Z', fallbackGroupSlug: null, mode: 'quick' });
+    assert.deepEqual(norm.posts.map((p) => p.id), ['1001', '1002', '1003', '1004', '1005']);
+    assert.equal(norm.posts[1].url, 'https://www.facebook.com/groups/testgroup/posts/1002/', 'slug from the page URL');
+    // 1001, 1003 and 1005 are named by their preview comments' links; 1002 and 1004 only by page data.
+    assert.deepEqual(norm.warnings.filter((w) => /page data/.test(w)).map((w) => w.match(/^Post (\d+)/)[1]), ['1002', '1004']);
+
+    const first = await page.evaluate(collectFeedPosts, {});
+    assert.equal(first.posts.length, 5);
+    assert.ok(first.posts.every((p) => p.idSource === 'react' && p.permalinkHref === null));
+    assert.deepEqual(first.diag.idSources, { link: 0, hover: 0, react: 5, linkAny: 0, comments: 0 });
+    assert.equal(first.diag.missing, 0);
+    assert.equal(first.posts[0].dateText, '1h', 'date from the header time link text');
+
+    const { seen, hovered, sources } = await scanFeedLikeDriver(page);
+    assert.deepEqual([...seen.keys()].sort(), ALL_30);
+    assert.deepEqual(sources, { link: 0, react: 30, linkAny: 0, comments: 0 });
+    assert.equal(hovered.length, 0);
+    assert.ok(!seen.has('5555'));
+
+    // The isolated-world view (chrome.scripting default) cannot see the fiber: same scan in a
+    // fresh JS world finds no ids and asks for hovers instead.
+    const cdp = await page.context().newCDPSession(page);
+    const { frameTree } = await cdp.send('Page.getFrameTree');
+    const { executionContextId } = await cdp.send('Page.createIsolatedWorld', { frameId: frameTree.frame.id, worldName: 'isolated-test' });
+    const { result } = await cdp.send('Runtime.evaluate', {
+      contextId: executionContextId,
+      expression: `(${collectFeedPosts.toString()})({markHoverFrom: 100})`,
+      returnByValue: true,
+    });
+    assert.equal(result.value.posts.filter((p) => p.idSource === 'react').length, 0, 'no fiber in an isolated world');
+    assert.ok(result.value.missing.length > 0);
+    assert.ok(result.value.diag.sampleShapes.length > 0 && result.value.diag.sampleShapes.length <= 3);
+    const shape = result.value.diag.sampleShapes[0];
+    assert.equal(shape.fiber, false);
+    assert.ok(shape.header.some((l) => l.href === '#'), 'the lazy permalink shows as "#"');
+    assert.ok(shape.header.some((l) => l.href === '/groups/{g}/user/{n}/'), 'profile links are masked');
+    const json = JSON.stringify(result.value.diag);
+    assert.doesNotMatch(json, /\d{5,}/, 'no ids in diag');
+    assert.doesNotMatch(json, /Kyaw|Thura|testgroup/, 'no names or slugs in diag');
+  } finally {
+    await page.close();
+  }
+});
+
+test('feed ?variant=roleless: posts without role=article are found as the feed\'s children', async () => {
+  const page = await openPage(`${FEED_URL}?variant=roleless`);
+  try {
+    assert.equal(await page.locator('[role="feed"] [role="article"]:not([aria-label])').count(), 0);
+    const first = await page.evaluate(collectFeedPosts, {});
+    assert.equal(first.diag.containerMode, 'children');
+    assert.deepEqual(first.posts.map((p) => p.postId), ['1001', '1002', '1003', '1004', '1005']);
+    assert.equal(first.posts[0].authorName, 'Kyaw Zin Thant');
+    assert.equal(first.posts[0].commentCountText, '1');
+
+    const { seen, sources } = await scanFeedLikeDriver(page);
+    assert.deepEqual([...seen.keys()].sort(), ALL_30);
+    assert.deepEqual(sources, { link: 29, react: 0, linkAny: 0, comments: 1 });
+    assert.equal(seen.get('1013').idSource, 'comments');
+
+    // extractRaw follows the same container rules.
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await page.waitForTimeout(200);
+    const raw = await page.evaluate(extractRaw, { scope: 'feed' });
+    assert.equal(raw.rootKind, 'feed');
+    const byId = new Map(raw.posts.filter((p) => p.permalinkHref).map((p) => [p.permalinkHref.match(/\/posts\/(\d+)\//)[1], p]));
+    assert.ok(byId.has('1001'));
+    assert.equal(byId.get('1001').items.length, 1, 'the preview comment belongs to its role-less post');
+    assert.equal(byId.get('1001').authorName, 'Kyaw Zin Thant');
+    assert.match(byId.get('1001').text, /^Which backend framework/);
+  } finally {
+    await page.close();
+  }
+});
+
+test('feed ?variant=twofeeds: an empty feed before the real one does not hide the posts', async () => {
+  const page = await openPage(`${FEED_URL}?variant=twofeeds`);
+  try {
+    assert.equal(await page.locator('[role="feed"]').count(), 2);
+    const first = await page.evaluate(collectFeedPosts, {});
+    assert.equal(first.diag.feeds, 2);
+    assert.deepEqual(first.posts.map((p) => p.postId), ['1001', '1002', '1003', '1004', '1005']);
+    const { seen } = await scanFeedLikeDriver(page);
+    assert.deepEqual([...seen.keys()].sort(), ALL_30);
+    const raw = await page.evaluate(extractRaw, { scope: 'auto' });
+    assert.equal(raw.rootKind, 'feed');
+    assert.ok(raw.posts.length >= 5);
+  } finally {
+    await page.close();
+  }
+});
+
+test('feed ?variant=hoverreset: lazy links are hover candidates and their href is read while hovered', async () => {
+  const page = await openPage(`${FEED_URL}?variant=hoverreset`);
+  try {
+    const { seen, hovered, viaHover, sources } = await scanFeedLikeDriver(page);
+    assert.deepEqual([...seen.keys()].sort(), ALL_30);
+    // Odd-index posts (no preview comments) can only be identified by hovering.
+    const odd = ALL_30.filter((id) => (Number(id) - 1001) % 2 === 1);
+    assert.deepEqual([...viaHover].sort(), odd);
+    assert.ok(hovered.every((h) => h.href === '#' && /^\d+[hd]$/.test(h.text)), 'the time link is the hover target');
+    assert.equal(sources.link + sources.comments + viaHover.size, 30);
+    // The href is gone again once the pointer has left.
+    assert.equal(await page.locator('a.js-lazy-time[href="#"]').count() > 0, true);
   } finally {
     await page.close();
   }
@@ -678,7 +1078,11 @@ test('probePage detects login walls and block notices', async () => {
     assert.equal(raw.rootKind, 'none');
     assert.deepEqual(raw.posts, []);
     const feedScan = await page.evaluate(collectFeedPosts, {});
-    assert.deepEqual(feedScan, { posts: [], missing: [], feedFound: false, renderedCount: 0 });
+    assert.deepEqual(
+      { posts: feedScan.posts, missing: feedScan.missing, feedFound: feedScan.feedFound, renderedCount: feedScan.renderedCount },
+      { posts: [], missing: [], feedFound: false, renderedCount: 0 },
+    );
+    assert.equal(feedScan.diag.feeds, 0);
 
     await page.setContent(`<!doctype html><html><body>
       <div role="feed"><div role="article" aria-labelledby="a"><span>post</span></div></div>
@@ -791,6 +1195,32 @@ test('feed: only the header link before the body is a post permalink', async () 
     assert.deepEqual(scan.posts.map((p) => p.postId), ['1111']);
     assert.equal(scan.missing.length, 1, 'post 2 is reported missing so it gets hovered');
     assert.equal(await page.locator('[data-fbcs-hover="0"]').innerText(), '2h', 'its header time link is the hover target');
+  } finally {
+    await page.close();
+  }
+});
+
+test('feed: preview comments vote once each — links pasted in a comment\'s text cannot outvote', async () => {
+  const page = await newPage();
+  try {
+    // Lazy header link, no React data: only the preview comments name the post. Comment A's
+    // timestamp names post 1001; its text pastes two links to another post's comments.
+    const pasted = (cid) => `<a href="${ORIGIN}/groups/g/posts/1777/?comment_id=${cid}">${ORIGIN}/groups/g/posts/1777/?comment_id=${cid}</a>`;
+    await page.setContent(
+      `<!doctype html><html><body><div role="feed"><div><div role="article" aria-labelledby="h">` +
+        `<h3><a href="${ORIGIN}/groups/g/user/1/"><span>Author</span></a></h3><span><a href="#"><span>2h</span></a></span>` +
+        `<div data-ad-rendering-role="story_message"><div dir="auto">Body</div></div>` +
+        `<div role="article" aria-label="Comment by A 1h"><a href="${ORIGIN}/groups/g/user/2/"><span dir="auto">A</span></a>` +
+        `<a aria-label="Wednesday 14 October 2026 at 00:10" href="${ORIGIN}/groups/g/posts/1001/?comment_id=91"><span>1h</span></a>` +
+        `<span dir="auto"><div dir="auto">See ${pasted(4242)} and ${pasted(4243)}</div></span></div>` +
+        `</div></div></div></body></html>`,
+    );
+    const scan = await page.evaluate(collectFeedPosts, {});
+    assert.deepEqual(scan.posts.map((p) => [p.postId, p.idSource]), [['1001', 'comments']]);
+    // extractRaw: the pasted links are in the comment's body — never its permalink.
+    const raw = await page.evaluate(extractRaw, { scope: 'feed' });
+    assert.equal(raw.posts[0].items.length, 1);
+    assert.equal(raw.posts[0].items[0].permalinkHref, `${ORIGIN}/groups/g/posts/1001/?comment_id=91`);
   } finally {
     await page.close();
   }

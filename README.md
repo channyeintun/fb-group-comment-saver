@@ -117,6 +117,8 @@ are kept. Removing the extension deletes them, so export first.
 | "Lost the connection to the tab" | You clicked **Cancel** on the yellow bar or closed the tab. Start again. |
 | "Temporarily blocked" / "going too fast" | Facebook rate-limited you. Wait, then raise **Delay between clicks** in Settings and crawl fewer posts. |
 | Facebook is not in English | Switch Facebook to English, or adapt the button patterns in **Settings → Advanced** (see below). |
+| A crawl logs "collected 0 post links" (or "No post ids found in the feed") | Facebook serves different page layouts to different accounts. Click **Copy diagnostics** (in the Progress card, or **Settings → Troubleshooting**) with the group feed open, and paste the report into your bug report. It holds no names, text or ids. |
+| Something else looks wrong on your account only | Open the page in question, click **Settings → Troubleshooting → Copy diagnostics**, and send the report. |
 | Using `m.facebook.com` | Not supported. Use `www.facebook.com` or `web.facebook.com`. |
 
 ## Features in detail
@@ -165,6 +167,10 @@ job is using it. The crawl:
 1. Opens the group feed with the chosen sort, unless the tab already shows exactly that feed in that
    order (another group page such as Members, or another sort, is not enough).
 2. Scrolls the feed and collects post links until it has *max posts* or the feed stops growing.
+   The post id comes from the post's timestamp link, or, when Facebook hasn't filled that link in,
+   from Facebook's own page data, other links of the post, its comments, or by hovering the link
+   (each post is hovered at most once, so a post that nothing names cannot hold up the scroll).
+   The log shows a one-line summary of where the ids came from.
 3. Opens each post and does the same as **Save all comments**.
 4. Goes back to the group feed when finished. You can turn this off in Settings.
 
@@ -214,6 +220,22 @@ Export formats (file names look like `fb-comments-all-20261014-0930.json`):
 | JSON     | Every field, with each post's comments nested in order (`format: "fb-comment-saver/v1"`). Best for backups and scripts. |
 | CSV      | One row per comment, with the post's details repeated on each row. UTF-8 **with BOM**, so Excel shows Myanmar (and other non-Latin) text correctly. Text cells that start with `=`, `+`, `-` or `@` get a leading `'` so spreadsheets show them as text instead of running them as formulas. Facebook ids have 16–17 digits, more than Excel keeps for a number: when opening the file in Excel or Sheets, import the id columns (`post_id`, `comment_id`, `parent_id`, `thread_id`, `author_id`) as **Text**. |
 | Markdown | Readable threads: each post followed by nested comment bullets. |
+
+### Copy diagnostics
+
+Facebook doesn't show every account the same page: it tests different layouts on different users.
+If the extension works for a friend but not for you, **Copy diagnostics** helps find out why. It
+is in **Settings → Troubleshooting**, and in the Progress card after a job that saved nothing or
+failed. It copies a report to the clipboard (or shows it in a text box if copying isn't allowed):
+
+- the extension version, browser and language;
+- how the active Facebook page is built: which elements and attributes exist, how many comments
+  have links, the *shape* of links (`/groups/{g}/posts/{n}/`), and the *shape* of button text
+  (`len14:digit+alpha+space`);
+- the last job's counters and its last 40 log lines.
+
+It contains **no names, no post or comment text, no ids (long numbers become `{n}`, `pfbid…` post
+ids become `{pfbid}`) and no full URLs**. Read it before you send it if you like: it's plain JSON.
 
 ## Your data stays local
 
@@ -273,7 +295,7 @@ Side panel (sidepanel.html)
    ▼
 Service worker: job runner ──── job state ──► chrome.storage.session ──► side panel progress
    │
-   ├─ quick:  chrome.scripting.executeScript(extractRaw) ─────────────┐
+   ├─ quick:  chrome.scripting.executeScript(extractRaw, MAIN world) ─┐
    │                                                                  │
    └─ post / crawl: playwright-crx attaches to the tab (chrome.debugger)
         Page: sort → All comments, scroll, click expanders and "See more"
@@ -285,9 +307,16 @@ Service worker: job runner ──── job state ──► chrome.storage.sessi
 ```
 
 - **Page functions** (`src/page/`) run inside the Facebook tab. They read the page and never change
-  it. Comments are `[role="article"]` elements with an `aria-label`. Replies are flat in the page
-  rather than nested, so reply depth comes from their indentation. Comment and reply IDs come from
-  each comment's timestamp link (`comment_id` / `reply_comment_id`).
+  its content (the feed scan only marks the links it hovers with `data-fbcs-*` attributes). Comments
+  are `[role="article"]` elements with an `aria-label`; a post is an article without one, or one
+  that has a post's parts (body, Like/Comment buttons), since some accounts get posts with an
+  `aria-label` too. Replies are flat in the page rather than nested, so reply depth comes from their
+  indentation. Comment and reply IDs come from each comment's timestamp link (`comment_id` /
+  `reply_comment_id`) — never from a link pasted in the comment's text, and never from a link that
+  Facebook hasn't filled in yet (`href="#"`, which points at the page itself). When Facebook leaves
+  those links empty, the IDs are read from Facebook's own page data (React props on the page
+  elements, readable only from the page's "MAIN world", which is why quick save and the driver run
+  there); a link that names another comment than that data is ignored.
 - **The Playwright driver** (`src/background/pw-driver.js`) performs the clicks and scrolling with
   real input events. It retries clicks that something else covers, such as the Messenger chat
   pop-up.
@@ -316,8 +345,8 @@ Project layout:
 build.mjs              esbuild bundling, static copy, manifest version, generated icons
 src/manifest.json      extension manifest (version filled in from package.json at build)
 src/background/        service worker, job runner, Playwright driver
-src/page/              self-contained functions that run in the Facebook tab
-src/lib/               settings, URL/date parsing, normalization, IndexedDB, exports
+src/page/              self-contained functions that run in the Facebook tab (extract, feed, probe, diagnose)
+src/lib/               settings, URL/date parsing, normalization, IndexedDB, exports, diagnostics masking
 src/ui/                side panel and library pages
 tests/                 unit, browser (fixtures) and e2e tests
 dist/                  build output: load this folder in Chrome

@@ -246,6 +246,23 @@ test('an unresponsive "View 1 reply" in some threads does not block the same lab
   }
 });
 
+test('posts with an aria-label (?variant=arialabel): the dialog is found, expanded and fully read', async () => {
+  // Some accounts may get post articles with an aria-label, like comments. They still own post
+  // sub-parts (data-ad-rendering-role), so the dialog holding one is the post root.
+  const page = await openPage(postUrl(1001, '?variant=arialabel&dialogDelay=1500'));
+  try {
+    assert.equal(await driver.waitForPostRoot(page, { timeoutMs: 15000 }), 'dialog');
+    const ctx = makeCtx();
+    const result = await driver.preparePost(page, ctx);
+    await expectFullyExpanded(page, result, ctx);
+    assert.ok(ctx.logs.some((l) => /Expanded the post text/.test(l.msg)), 'the post-level "See more" is the post\'s');
+    const raw = await page.evaluate(extractRaw, { scope: 'auto' });
+    assert.equal(raw.posts[0].items.some((c) => /Feed Preview/.test(c.ariaLabel)), false, 'never the feed behind');
+  } finally {
+    await page.close();
+  }
+});
+
 test('preparePost stops when the post dialog is closed mid-scan (never expands the page behind)', async () => {
   const page = await openPage(postUrl(1001));
   try {
@@ -265,6 +282,107 @@ test('preparePost stops when the post dialog is closed mid-scan (never expands t
     assert.ok(closed, 'the dialog was closed during the scan');
     assert.equal(new URL(page.url()).pathname, '/groups/testgroup/');
     assert.ok(!ctx.logs.some((l) => /All comments loaded/.test(l.msg)));
+  } finally {
+    await page.close();
+  }
+});
+
+// ------------------------------------------------------------------------------------------------
+// collectFeedLinks on the feed markup variants (tests/fixtures/feed.html)
+
+const ALL_30 = Array.from({ length: 30 }, (_, i) => String(1001 + i));
+const feedUrl = (query = '') => `${ORIGIN}/groups/testgroup/${query}`;
+
+async function collectAll(query, overrides = {}) {
+  const page = await openPage(feedUrl(query));
+  try {
+    const ctx = makeCtx({ maxPosts: 30, groupUrl: `${ORIGIN}/groups/othergroup`, ...overrides });
+    const links = await driver.collectFeedLinks(page, ctx);
+    return { links, logs: ctx.logs };
+  } finally {
+    await page.close();
+  }
+}
+
+test('collectFeedLinks: plain feed — ids from links, the page\'s own group, one summary line', async () => {
+  const { links, logs } = await collectAll('');
+  assert.deepEqual(links.map((l) => l.postId).sort(), ALL_30);
+  // The feed page's group wins over the settings' group (othergroup).
+  assert.ok(links.every((l) => l.url === `https://www.facebook.com/groups/testgroup/posts/${l.postId}/`));
+  const summary = logs.filter((l) => /^Feed scan: /.test(l.msg));
+  assert.equal(summary.length, 1);
+  assert.match(summary[0].msg, /ids from links 29, page data 0, comment links 1, hover 0; 0 without an id\./);
+  assert.ok(!logs.some((l) => l.level === 'warn'));
+});
+
+test('collectFeedLinks: ?variant=nohref — every id from React page data', async () => {
+  const { links, logs } = await collectAll('?variant=nohref');
+  assert.deepEqual(links.map((l) => l.postId).sort(), ALL_30);
+  assert.ok(logs.some((l) => /ids from links 0, page data 30, comment links 0, hover 0; 0 without an id\./.test(l.msg)));
+});
+
+test('collectFeedLinks: ?variant=hoverreset — hovered links are read before the href goes away', async () => {
+  const { links, logs } = await collectAll('?variant=hoverreset');
+  assert.deepEqual(links.map((l) => l.postId).sort(), ALL_30);
+  assert.ok(logs.some((l) => /ids from links \d+, page data 0, comment links \d+, hover 15; 0 without an id\./.test(l.msg)), logs.map((l) => l.msg).join('\n'));
+});
+
+test('collectFeedLinks: ?variant=roleless,twofeeds — role-less posts in the second feed', async () => {
+  const { links } = await collectAll('?variant=roleless,twofeeds');
+  assert.deepEqual(links.map((l) => l.postId).sort(), ALL_30);
+});
+
+test('collectFeedLinks: ?variant=arialabel — posts with an aria-label are collected', async () => {
+  const { links, logs } = await collectAll('?variant=arialabel');
+  assert.deepEqual(links.map((l) => l.postId).sort(), ALL_30);
+  assert.ok(logs.some((l) => /ids from links 29, page data 0, comment links 1, hover 0; 0 without an id\./.test(l.msg)));
+});
+
+test('collectFeedLinks: a post nothing names is hovered once and does not stall the scan', async () => {
+  // ?variant=nohref&noid=1004: post 1004 has a lazy "#" time link that is never filled, no React
+  // data and no comments. Hovering it scrolls back to it, so it must be tried only once.
+  const page = await openPage(feedUrl('?variant=nohref&noid=1004'));
+  try {
+    const hovered = [];
+    const hover = page.hover.bind(page);
+    page.hover = async (selector, opts) => {
+      hovered.push(await page.locator(selector).evaluate((el) => el.closest('[role="article"]').getAttribute('aria-labelledby')));
+      return hover(selector, opts);
+    };
+    const ctx = makeCtx({ maxPosts: 30, groupUrl: `${ORIGIN}/groups/testgroup` });
+    const links = await driver.collectFeedLinks(page, ctx);
+    assert.deepEqual(links.map((l) => l.postId).sort(), ALL_30.filter((id) => id !== '1004'));
+    assert.deepEqual(hovered, ['_r_1004a_ _r_1004b_'], 'one hover, on post 1004');
+    assert.ok(
+      ctx.logs.some((l) => /^Feed scan: 30 posts seen — ids from links 0, page data 29, comment links 0, hover 0; 1 without an id\.$/.test(l.msg)),
+      ctx.logs.map((l) => l.msg).join('\n'),
+    );
+    assert.ok(!ctx.logs.some((l) => l.level === 'warn'), 'ids were found: no diagnostics warning');
+  } finally {
+    await page.close();
+  }
+});
+
+test('collectFeedLinks: no id anywhere → a masked diagnostics warning', async () => {
+  // Every header link is lazy and nothing else names the posts (no fiber, no comments).
+  const post = (n) =>
+    `<div role="article" aria-labelledby="h${n}"><h3><a href="${ORIGIN}/groups/g/user/10000${n}/"><span>Author Name ${n}</span></a></h3>` +
+    `<span><a href="#" aria-labelledby="t${n}"><span id="t${n}">${n}h</span></a></span>` +
+    `<div data-ad-rendering-role="story_message"><div dir="auto">Secret body ${n}</div></div></div>`;
+  const html = `<!doctype html><html><body><div role="feed">${[1, 2, 3, 4].map((n) => `<div>${post(n)}</div>`).join('')}</div></body></html>`;
+  const page = await openPage(null, { '/groups/testgroup/': html });
+  try {
+    await page.goto(feedUrl());
+    const ctx = makeCtx({ maxPosts: 5, groupUrl: `${ORIGIN}/groups/testgroup` });
+    const links = await driver.collectFeedLinks(page, ctx);
+    assert.deepEqual(links, []);
+    const warn = ctx.logs.find((l) => l.level === 'warn');
+    assert.ok(warn, 'a warning is logged');
+    assert.match(warn.msg, /Copy diagnostics/);
+    assert.match(warn.msg, /"containerMode":"article"/);
+    assert.match(warn.msg, /"href":"#"/);
+    assert.doesNotMatch(warn.msg, /Author Name|Secret body|\d{5,}/);
+    assert.ok(ctx.logs.some((l) => /Feed scan: 4 posts seen — ids from links 0, page data 0, comment links 0, hover 0; 4 without an id\./.test(l.msg)));
   } finally {
     await page.close();
   }

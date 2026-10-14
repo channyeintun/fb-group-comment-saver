@@ -22,6 +22,26 @@
     preview comments : posts with an even index and comments > 0 have one comment article
                        ("Comment by …") plus "View more comments" when they have > 1 comment.
     authors          : rotate through 7 names (index % 7); "Chai_lover🍵" has an emoji <img alt>.
+
+  MARKUP VARIANTS (?variant=a,b — comma-separated; or window.FBCS_FIXTURE_VARIANT set before this
+  script runs, which the e2e harness injects so canonical post URLs keep the variant). Facebook
+  serves different markup to different accounts (SPEC §1, §4.2):
+    nohref     : every post's header time link has href="#" and is never filled in (not even on
+                 hover). Each post article carries a fake React fiber chain
+                 (article['__reactFiber$test'] → .return.memoizedProps.feedUnit.id =
+                 btoa('S:_I999:VK:<postId>')), like Facebook's, readable from the MAIN world only.
+                 All 30 ids come from that page data (idSource 'react').
+    roleless   : posts are plain <div>s without role=article (comment previews keep
+                 role=article + aria-label). Ids from header links (29) and, for the lazy post 1013,
+                 from its preview comment's link (idSource 'comments').
+    twofeeds   : an extra, empty [role=feed] ("Featured") comes before the real feed.
+    hoverreset : every odd-index post (1002, 1004, …: no preview comments) has a lazy time link that
+                 gets its href only while hovered and loses it again on mouseout.
+    arialabel  : post articles carry an aria-label ("<author>'s post") besides aria-labelledby, like
+                 comments do; they are still posts (they own data-ad-rendering-role parts).
+  QUERY PARAMS (not part of the e2e variant injection):
+    ?noid=<id>[,<id>…] : with nohref, these posts get no fake fiber either — nothing names them
+                 (no href, no page data; 1004, 1008, … also have no comments). Hovering never helps.
 -->
 <html lang="en" dir="ltr">
 <head>
@@ -81,6 +101,13 @@
   var ORIGIN = /(^|\.)facebook\.com$/.test(location.hostname) ? location.origin : 'https://www.facebook.com';
   var TOTAL = 30, BATCH = 5, FIRST_ID = 1001, LAZY_ID = 1013, VIRTUALIZE_PX = 2500, NEAR_BOTTOM_PX = 1200;
   var TRACK = '__cft__[0]=AZX&__tn__=%2CO%2CP-R';
+  var VARIANTS = (new URLSearchParams(location.search).get('variant') || window.FBCS_FIXTURE_VARIANT || '').split(',');
+  var NOHREF = VARIANTS.indexOf('nohref') !== -1;
+  var ROLELESS = VARIANTS.indexOf('roleless') !== -1;
+  var TWO_FEEDS = VARIANTS.indexOf('twofeeds') !== -1;
+  var HOVER_RESET = VARIANTS.indexOf('hoverreset') !== -1;
+  var ARIA_LABEL = VARIANTS.indexOf('arialabel') !== -1;
+  var NO_ID = (new URLSearchParams(location.search).get('noid') || '').split(',').map(Number);
 
   function esc(s) {
     return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -146,17 +173,28 @@
     var id = FIRST_ID + i;
     var a = AUTHORS[i % AUTHORS.length];
     var name = a[0], uid = a[1], nameHtml = a[2] || esc(a[0]);
-    var lazy = id === LAZY_ID;
-    var permalink = lazy ? '#' : postUrl(id) + '?' + TRACK;
+    // Lazy: href "#" until hovered (post 1013; odd posts with ?variant=hoverreset). nohref: never filled.
+    var lazy = !NOHREF && (id === LAZY_ID || (HOVER_RESET && i % 2 === 1));
+    var permalink = lazy || NOHREF ? '#' : postUrl(id) + '?' + TRACK;
     var likes = ((i * 5) % 17) + 1;
     var comments = commentCount(i);
     var shares = i % 3;
 
     var unit = document.createElement('div');
     var art = document.createElement('div');
-    art.setAttribute('role', 'article');
-    art.setAttribute('aria-labelledby', '_r_' + id + 'a_ _r_' + id + 'b_');
+    if (!ROLELESS) {
+      art.setAttribute('role', 'article');
+      art.setAttribute('aria-labelledby', '_r_' + id + 'a_ _r_' + id + 'b_');
+      if (ARIA_LABEL) art.setAttribute('aria-label', name + "'s post");
+    }
     art.className = 'card';
+    if (NOHREF && NO_ID.indexOf(id) === -1) {
+      // Fake React fiber (MAIN world expando): the feed unit's id names the post.
+      art['__reactFiber$test'] = {
+        memoizedProps: { className: 'x1' },
+        return: { memoizedProps: { feedUnit: { id: btoa('S:_I999:VK:' + id) } }, return: null }
+      };
+    }
     art.innerHTML =
       '<div class="post-header">' +
         '<a role="link" tabindex="-1" aria-label="' + esc(name) + '" class="avatar40" href="' + esc(userUrl(uid)) + '"><svg width="40" height="40" aria-hidden="true"><circle cx="20" cy="20" r="20" fill="#8a8d91"/></svg></a>' +
@@ -169,7 +207,7 @@
       '</div>' +
       '<div data-ad-rendering-role="story_message" class="story"><div data-ad-preview="message" data-ad-comet-preview="message">' +
         '<div dir="auto">' + TEXTS[i % TEXTS.length] + ' #' + (i + 1) + '</div>' +
-        (lazy ? '<div dir="auto">See also <a role="link" tabindex="0" href="' + esc(postUrl(5555) + '?' + TRACK) + '">' + esc(postUrl(5555)) + '</a></div>' : '') +
+        (id === LAZY_ID ? '<div dir="auto">See also <a role="link" tabindex="0" href="' + esc(postUrl(5555) + '?' + TRACK) + '">' + esc(postUrl(5555)) + '</a></div>' : '') +
         '</div></div>' +
       '<div class="photo"></div>' +
       '<div class="post-counts">' +
@@ -224,13 +262,27 @@
   function fillLazyHref(e) {
     var a = e.target && e.target.closest ? e.target.closest('a.js-lazy-time') : null;
     if (a && a.getAttribute('href') === '#') {
-      a.setAttribute('href', postUrl(postIdOf.get(a.closest('[role="article"]'))) + '?' + TRACK);
+      a.setAttribute('href', postUrl(postIdOf.get(a.closest('.card'))) + '?' + TRACK);
     }
+  }
+
+  /** ?variant=hoverreset: the href goes away again when the pointer leaves the link. */
+  function resetLazyHref(e) {
+    var a = e.target && e.target.closest ? e.target.closest('a.js-lazy-time') : null;
+    if (!a || (e.relatedTarget && a.contains(e.relatedTarget))) return;
+    if (postIdOf.get(a.closest('.card')) !== LAZY_ID) a.setAttribute('href', '#');
   }
 
   document.querySelector('.js-group-link').setAttribute('href', ORIGIN + '/groups/' + SLUG + '/');
   document.addEventListener('mouseover', fillLazyHref);
   document.addEventListener('focusin', fillLazyHref);
+  if (HOVER_RESET) document.addEventListener('mouseout', resetLazyHref);
+  if (TWO_FEEDS) {
+    var featured = document.createElement('div');
+    featured.setAttribute('role', 'feed');
+    featured.setAttribute('aria-label', 'Featured');
+    feed.parentNode.insertBefore(featured, feed);
+  }
   window.addEventListener('scroll', function () { virtualize(); maybeLoadMore(); }, { passive: true });
   appendBatch();
 })();
